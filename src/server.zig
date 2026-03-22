@@ -53,6 +53,14 @@ pub fn Server(comptime Handler: type) type {
             };
         }
 
+        pub fn initializeResult(self: *const Self) types.InitializeResult {
+            return .{
+                .capabilities = self.capabilities,
+                .serverInfo = self.server_info,
+                .instructions = self.instructions,
+            };
+        }
+
         /// Run the server over stdio. Blocks until stdin is closed.
         pub fn start(self: *Self, io: Io) !void {
             const read_buf = try self.allocator.alloc(u8, self.read_buffer_size);
@@ -91,12 +99,7 @@ pub fn Server(comptime Handler: type) type {
                 switch (parsed.value) {
                     .request => |req| {
                         if (mem.eql(u8, req.method, "initialize")) {
-                            const result = types.InitializeResult{
-                                .capabilities = self.capabilities,
-                                .serverInfo = self.server_info,
-                                .instructions = self.instructions,
-                            };
-                            try json_rpc.sendResult(self.allocator, req.id, result, writer);
+                            try json_rpc.sendResult(self.allocator, req.id, self.initializeResult(), writer);
                             return;
                         } else if (mem.eql(u8, req.method, "ping")) {
                             try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
@@ -163,7 +166,7 @@ pub fn Server(comptime Handler: type) type {
         // Request routing
         // =================================================================
 
-        fn handleRequest(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
+        pub fn handleRequest(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
             if (mem.eql(u8, req.method, "ping")) {
                 return json_rpc.sendEmptyResult(self.allocator, req.id, writer);
             }
@@ -206,7 +209,7 @@ pub fn Server(comptime Handler: type) type {
             return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
         }
 
-        fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
+        pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
             _ = self;
             _ = notif;
         }

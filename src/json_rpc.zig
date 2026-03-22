@@ -394,15 +394,30 @@ pub const EmptyResult = struct {
 };
 
 // ============================================================================
+// Serialization helpers — produce JSON-RPC response bytes
+// ============================================================================
+
+/// Serialize a JSON-RPC success response to bytes. Caller owns returned memory.
+pub fn serializeResult(allocator: Allocator, id: Id, result: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, GenericResponse(@TypeOf(result)){
+        .result = result,
+        .id = id,
+    }, json_stringify_options);
+}
+
+/// Serialize a JSON-RPC error response to bytes. Caller owns returned memory.
+pub fn serializeError(allocator: Allocator, id: ?Id, code: ErrorCode, data: ?[]const u8) ![]const u8 {
+    const err_resp = ErrorResponse.fromErrorCode(code, id, if (data) |d| .{ .string = d } else null);
+    return std.json.Stringify.valueAlloc(allocator, err_resp, json_stringify_options);
+}
+
+// ============================================================================
 // Transport helpers — send JSON-RPC messages over an Io.Writer
 // ============================================================================
 
 /// Write a JSON-RPC success response and flush.
 pub fn sendResult(allocator: Allocator, id: Id, result: anytype, writer: *Io.Writer) !void {
-    const bytes = try std.json.Stringify.valueAlloc(allocator, GenericResponse(@TypeOf(result)){
-        .result = result,
-        .id = id,
-    }, json_stringify_options);
+    const bytes = try serializeResult(allocator, id, result);
     defer allocator.free(bytes);
     try writer.writeAll(bytes);
     try writer.writeByte('\n');
@@ -416,8 +431,7 @@ pub fn sendEmptyResult(allocator: Allocator, id: Id, writer: *Io.Writer) !void {
 
 /// Write a JSON-RPC error response and flush.
 pub fn sendError(allocator: Allocator, id: ?Id, code: ErrorCode, data: ?[]const u8, writer: *Io.Writer) !void {
-    const err_resp = ErrorResponse.fromErrorCode(code, id, if (data) |d| .{ .string = d } else null);
-    const bytes = try std.json.Stringify.valueAlloc(allocator, err_resp, json_stringify_options);
+    const bytes = try serializeError(allocator, id, code, data);
     defer allocator.free(bytes);
     try writer.writeAll(bytes);
     try writer.writeByte('\n');
