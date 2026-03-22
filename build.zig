@@ -115,6 +115,31 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // Example: greeter MCP server
+    const example_exe = b.addExecutable(.{
+        .name = "greeter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/greeter.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig_mcp_sdk", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(example_exe);
+
+    const example_run_cmd = b.addRunArtifact(example_exe);
+    example_run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        example_run_cmd.addArgs(args);
+    }
+
+    const example_step = b.step("example", "Build and run the greeter example");
+    example_step.dependOn(&example_run_cmd.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
