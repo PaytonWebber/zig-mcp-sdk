@@ -144,10 +144,11 @@ pub fn Server(comptime Handler: type) type {
 
                 switch (parsed.value) {
                     .request => |req| {
-                        if (mem.eql(u8, req.method, "initialize")) {
+                        const h = methodHash(req.method);
+                        if (h == comptime methodHash("initialize")) {
                             try json_rpc.sendResult(self.allocator, req.id, self.initializeResult(), writer);
                             return;
-                        } else if (mem.eql(u8, req.method, "ping")) {
+                        } else if (h == comptime methodHash("ping")) {
                             try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
                         } else {
                             try json_rpc.sendError(self.allocator, req.id, .invalid_request, null, writer);
@@ -167,12 +168,12 @@ pub fn Server(comptime Handler: type) type {
 
                 switch (parsed.value) {
                     .notification => |notif| {
-                        if (mem.eql(u8, notif.method, "notifications/initialized")) {
+                        if (methodHash(notif.method) == comptime methodHash("notifications/initialized")) {
                             return;
                         }
                     },
                     .request => |req| {
-                        if (mem.eql(u8, req.method, "ping")) {
+                        if (methodHash(req.method) == comptime methodHash("ping")) {
                             try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
                         }
                     },
@@ -212,18 +213,23 @@ pub fn Server(comptime Handler: type) type {
         // Request routing
         // =================================================================
 
+        fn methodHash(name: []const u8) u64 {
+            return std.hash.Wyhash.hash(0, name);
+        }
+
         pub fn handleRequest(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
-            if (mem.eql(u8, req.method, "ping")) {
+            const hash = methodHash(req.method);
+
+            if (hash == comptime methodHash("ping")) {
                 return json_rpc.sendEmptyResult(self.allocator, req.id, writer);
             }
 
-            // Simple dispatch (no params)
             inline for (.{
                 .{ "tools/list", "listTools" },
                 .{ "resources/list", "listResources" },
                 .{ "prompts/list", "listPrompts" },
             }) |route| {
-                if (mem.eql(u8, req.method, route[0])) {
+                if (hash == comptime methodHash(route[0])) {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchSimple(req.id, route[1], writer);
                     }
@@ -231,12 +237,11 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            // Dispatch with params
             inline for (.{
                 .{ "resources/read", "readResource", types.ReadResourceParams },
                 .{ "prompts/get", "getPrompt", types.GetPromptParams },
             }) |route| {
-                if (mem.eql(u8, req.method, route[0])) {
+                if (hash == comptime methodHash(route[0])) {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchWithParams(req, route[1], route[2], writer);
                     }
@@ -244,8 +249,7 @@ pub fn Server(comptime Handler: type) type {
                 }
             }
 
-            // Tool call has special error handling (errors become isError=true results)
-            if (mem.eql(u8, req.method, "tools/call")) {
+            if (hash == comptime methodHash("tools/call")) {
                 if (comptime @hasDecl(Handler, "callTool")) {
                     return self.dispatchToolCall(req, writer);
                 }
@@ -257,7 +261,7 @@ pub fn Server(comptime Handler: type) type {
 
         pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
             if (comptime @hasDecl(Handler, "handlePermissionRequest")) {
-                if (mem.eql(u8, notif.method, types.permission_request_method)) {
+                if (methodHash(notif.method) == comptime methodHash(types.permission_request_method)) {
                     const ctx = self.context orelse return;
                     const params = types.PermissionRequestParams.fromJson(notif.params orelse return) catch return;
                     self.handler.handlePermissionRequest(ctx, params);
