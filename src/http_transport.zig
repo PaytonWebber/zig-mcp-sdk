@@ -236,7 +236,7 @@ pub fn HttpTransport(comptime Handler: type) type {
                     var writer = Io.Writer.fixed(&response_buf);
 
                     self.server.handleRequest(req, &writer) catch |err| {
-                        json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), &writer) catch {};
+                        json_rpc.sendError(req.id, .internal_error, @errorName(err), &writer) catch {};
                     };
 
                     const written = response_buf[0..writer.end];

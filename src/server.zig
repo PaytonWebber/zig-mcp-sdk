@@ -12,19 +12,18 @@ const types = @import("types.zig");
 /// Passed to handler callbacks like `onReady` and `handlePermissionRequest`.
 /// Handlers may store this value for later use (e.g. to push channel events).
 pub const Context = struct {
-    allocator: Allocator,
     writer: *Io.Writer,
 
     pub fn sendChannelEvent(self: Context, params: types.ChannelEventParams) !void {
-        try json_rpc.sendNotification(self.allocator, types.channel_event_method, params, self.writer);
+        try json_rpc.sendNotification(types.channel_event_method, params, self.writer);
     }
 
     pub fn sendPermissionVerdict(self: Context, params: types.PermissionVerdictParams) !void {
-        try json_rpc.sendNotification(self.allocator, types.permission_verdict_method, params, self.writer);
+        try json_rpc.sendNotification(types.permission_verdict_method, params, self.writer);
     }
 
     pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
-        try json_rpc.sendNotification(self.allocator, method, params, self.writer);
+        try json_rpc.sendNotification(method, params, self.writer);
     }
 };
 
@@ -113,7 +112,7 @@ pub fn Server(comptime Handler: type) type {
 
         /// Run the server with arbitrary reader/writer (useful for testing).
         pub fn run(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
-            self.context = .{ .allocator = self.allocator, .writer = writer };
+            self.context = .{ .writer = writer };
             defer self.context = null;
 
             var parse_arena = ArenaAllocator.init(self.allocator);
@@ -142,7 +141,7 @@ pub fn Server(comptime Handler: type) type {
 
                 const line = try json_rpc.readLine(reader);
                 const message = json_rpc.parseMessageWith(parse_arena, line) catch {
-                    try json_rpc.sendError(self.allocator, null, .parse_error, null, writer);
+                    try json_rpc.sendError(null, .parse_error, null, writer);
                     continue;
                 };
 
@@ -150,12 +149,12 @@ pub fn Server(comptime Handler: type) type {
                     .request => |req| {
                         const h = methodHash(req.method);
                         if (h == comptime methodHash("initialize")) {
-                            try json_rpc.sendResult(self.allocator, req.id, self.initializeResult(), writer);
+                            try json_rpc.sendResult(req.id, self.initializeResult(), writer);
                             return;
                         } else if (h == comptime methodHash("ping")) {
-                            try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+                            try json_rpc.sendEmptyResult(req.id, writer);
                         } else {
-                            try json_rpc.sendError(self.allocator, req.id, .invalid_request, null, writer);
+                            try json_rpc.sendError(req.id, .invalid_request, null, writer);
                         }
                     },
                     .notification => {},
@@ -164,7 +163,7 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        fn waitForInitialized(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn waitForInitialized(_: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
                 defer _ = parse_arena.reset(.retain_capacity);
 
@@ -179,7 +178,7 @@ pub fn Server(comptime Handler: type) type {
                     },
                     .request => |req| {
                         if (methodHash(req.method) == comptime methodHash("ping")) {
-                            try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+                            try json_rpc.sendEmptyResult(req.id, writer);
                         }
                     },
                     else => {},
@@ -197,14 +196,14 @@ pub fn Server(comptime Handler: type) type {
                         error.InvalidJson => .parse_error,
                         else => .invalid_request,
                     };
-                    try json_rpc.sendError(self.allocator, null, code, null, writer);
+                    try json_rpc.sendError(null, code, null, writer);
                     continue;
                 };
 
                 switch (message) {
                     .request => |req| {
                         self.handleRequest(req, writer) catch |err| {
-                            json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), writer) catch {};
+                            json_rpc.sendError(req.id, .internal_error, @errorName(err), writer) catch {};
                         };
                     },
                     .notification => |notif| {
@@ -227,7 +226,7 @@ pub fn Server(comptime Handler: type) type {
             const hash = methodHash(req.method);
 
             if (hash == comptime methodHash("ping")) {
-                return json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+                return json_rpc.sendEmptyResult(req.id, writer);
             }
 
             inline for (.{
@@ -239,7 +238,7 @@ pub fn Server(comptime Handler: type) type {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchSimple(req.id, route[1], writer);
                     }
-                    return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                    return json_rpc.sendError(req.id, .method_not_found, null, writer);
                 }
             }
 
@@ -251,7 +250,7 @@ pub fn Server(comptime Handler: type) type {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchWithParams(req, route[1], route[2], writer);
                     }
-                    return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                    return json_rpc.sendError(req.id, .method_not_found, null, writer);
                 }
             }
 
@@ -259,10 +258,10 @@ pub fn Server(comptime Handler: type) type {
                 if (comptime @hasDecl(Handler, "callTool")) {
                     return self.dispatchToolCall(req, writer);
                 }
-                return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                return json_rpc.sendError(req.id, .method_not_found, null, writer);
             }
 
-            return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+            return json_rpc.sendError(req.id, .method_not_found, null, writer);
         }
 
         pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
@@ -285,9 +284,9 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const result = @field(Handler, method)(self.handler, arena.allocator()) catch |err| {
-                return json_rpc.sendError(self.allocator, id, .internal_error, @errorName(err), writer);
+                return json_rpc.sendError(id, .internal_error, @errorName(err), writer);
             };
-            try json_rpc.sendResult(self.allocator, id, result, writer);
+            try json_rpc.sendResult(id, result, writer);
         }
 
         fn dispatchWithParams(
@@ -301,19 +300,18 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const params = Params.fromJson(req.params orelse return json_rpc.sendError(
-                self.allocator,
                 req.id,
                 .invalid_params,
                 null,
                 writer,
             )) catch {
-                return json_rpc.sendError(self.allocator, req.id, .invalid_params, null, writer);
+                return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
             const result = @field(Handler, method)(self.handler, arena.allocator(), params) catch |err| {
-                return json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), writer);
+                return json_rpc.sendError(req.id, .internal_error, @errorName(err), writer);
             };
-            try json_rpc.sendResult(self.allocator, req.id, result, writer);
+            try json_rpc.sendResult(req.id, result, writer);
         }
 
         fn dispatchToolCall(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
@@ -321,13 +319,12 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const params = types.CallToolParams.fromJson(req.params orelse return json_rpc.sendError(
-                self.allocator,
                 req.id,
                 .invalid_params,
                 null,
                 writer,
             )) catch {
-                return json_rpc.sendError(self.allocator, req.id, .invalid_params, null, writer);
+                return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
             const result = self.handler.callTool(arena.allocator(), params) catch |err| {
@@ -335,9 +332,9 @@ pub fn Server(comptime Handler: type) type {
                     .content = &.{types.Content.text_content(@errorName(err))},
                     .isError = true,
                 };
-                return json_rpc.sendResult(self.allocator, req.id, error_result, writer);
+                return json_rpc.sendResult(req.id, error_result, writer);
             };
-            try json_rpc.sendResult(self.allocator, req.id, result, writer);
+            try json_rpc.sendResult(req.id, result, writer);
         }
     };
 }
