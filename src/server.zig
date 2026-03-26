@@ -354,9 +354,11 @@ const TestHandler = struct {
         };
     }
 
-    pub fn callTool(_: *TestHandler, _: Allocator, params: types.CallToolParams) !types.CallToolResult {
+    pub fn callTool(_: *TestHandler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
         if (mem.eql(u8, params.name, "test_tool")) {
-            return .{ .content = &.{types.Content.text_content("hello")} };
+            const content = try allocator.alloc(types.Content, 1);
+            content[0] = types.Content.text_content("hello");
+            return .{ .content = content };
         }
         return error.ToolNotFound;
     }
