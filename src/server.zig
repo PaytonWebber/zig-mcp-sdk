@@ -59,22 +59,27 @@ pub fn Server(comptime Handler: type) type {
     return struct {
         const Self = @This();
 
-        allocator: Allocator,
+        // Hot fields — accessed on every request dispatch
         handler: *Handler,
-        server_info: types.Implementation,
+        context: ?Context = null,
         capabilities: types.ServerCapabilities,
+
+        // Warm fields — accessed during initialization and response
+        server_info: types.Implementation,
         instructions: ?[]const u8,
+
+        // Cold fields — read once at startup
+        allocator: Allocator,
         read_buffer_size: usize,
         write_buffer_size: usize,
-        context: ?Context = null,
 
         pub fn init(allocator: Allocator, handler: *Handler, options: Options) Self {
             return .{
-                .allocator = allocator,
                 .handler = handler,
-                .server_info = options.server_info,
                 .capabilities = options.capabilities,
+                .server_info = options.server_info,
                 .instructions = options.instructions,
+                .allocator = allocator,
                 .read_buffer_size = options.read_buffer_size,
                 .write_buffer_size = options.write_buffer_size,
             };
