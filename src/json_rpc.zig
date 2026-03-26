@@ -225,6 +225,19 @@ pub fn parseMessage(allocator: Allocator, input: []const u8) MessageParseError!s
     };
 }
 
+/// Parse a message into a caller-owned arena. The caller is responsible for
+/// resetting or freeing the arena; parsed data borrows from it.
+pub fn parseMessageWith(arena: *ArenaAllocator, input: []const u8) MessageParseError!Message {
+    const value = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        input,
+        .{ .allocate = .alloc_always },
+    ) catch return error.InvalidJson;
+
+    return messageFromValue(value);
+}
+
 /// Parse a JSON-RPC 2.0 batch (array of messages) from a JSON byte string.
 /// Per the spec, an empty array is an invalid request.
 pub fn parseBatch(allocator: Allocator, input: []const u8) MessageParseError!std.json.Parsed([]Message) {
@@ -440,37 +453,38 @@ pub fn serializeError(allocator: Allocator, id: ?Id, code: ErrorCode, data: ?[]c
 }
 
 // ============================================================================
-// Transport helpers — send JSON-RPC messages over an Io.Writer
+// Transport helpers — stream JSON-RPC messages directly to an Io.Writer
 // ============================================================================
 
 /// Write a JSON-RPC success response and flush.
-pub fn sendResult(allocator: Allocator, id: Id, result: anytype, writer: *Io.Writer) !void {
-    const bytes = try serializeResult(allocator, id, result);
-    defer allocator.free(bytes);
-    try writer.writeAll(bytes);
+pub fn sendResult(id: Id, result: anytype, writer: *Io.Writer) !void {
+    try std.json.Stringify.value(GenericResponse(@TypeOf(result)){
+        .result = result,
+        .id = id,
+    }, json_stringify_options, writer);
     try writer.writeByte('\n');
     try writer.flush();
 }
 
 /// Write a JSON-RPC success response with an empty object result.
-pub fn sendEmptyResult(allocator: Allocator, id: Id, writer: *Io.Writer) !void {
-    return sendResult(allocator, id, EmptyResult{}, writer);
+pub fn sendEmptyResult(id: Id, writer: *Io.Writer) !void {
+    return sendResult(id, EmptyResult{}, writer);
 }
 
 /// Write a JSON-RPC notification and flush.
-pub fn sendNotification(allocator: Allocator, method: []const u8, params: anytype, writer: *Io.Writer) !void {
-    const bytes = try serializeNotification(allocator, method, params);
-    defer allocator.free(bytes);
-    try writer.writeAll(bytes);
+pub fn sendNotification(method: []const u8, params: anytype, writer: *Io.Writer) !void {
+    try std.json.Stringify.value(GenericNotification(@TypeOf(params)){
+        .method = method,
+        .params = params,
+    }, json_stringify_options, writer);
     try writer.writeByte('\n');
     try writer.flush();
 }
 
 /// Write a JSON-RPC error response and flush.
-pub fn sendError(allocator: Allocator, id: ?Id, code: ErrorCode, data: ?[]const u8, writer: *Io.Writer) !void {
-    const bytes = try serializeError(allocator, id, code, data);
-    defer allocator.free(bytes);
-    try writer.writeAll(bytes);
+pub fn sendError(id: ?Id, code: ErrorCode, data: ?[]const u8, writer: *Io.Writer) !void {
+    const err_resp = ErrorResponse.fromErrorCode(code, id, if (data) |d| .{ .string = d } else null);
+    try std.json.Stringify.value(err_resp, json_stringify_options, writer);
     try writer.writeByte('\n');
     try writer.flush();
 }

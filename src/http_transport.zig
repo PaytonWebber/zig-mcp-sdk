@@ -5,6 +5,8 @@ const Allocator = mem.Allocator;
 const Io = std.Io;
 const http = std.http;
 
+const ArenaAllocator = std.heap.ArenaAllocator;
+
 const json_rpc = @import("json_rpc.zig");
 const types = @import("types.zig");
 const server_mod = @import("server.zig");
@@ -77,18 +79,21 @@ pub fn HttpTransport(comptime Handler: type) type {
             var stream_writer = stream.writer(io, write_buf);
             var http_server = http.Server.init(&stream_reader.interface, &stream_writer.interface);
 
+            var parse_arena = ArenaAllocator.init(self.allocator);
+            defer parse_arena.deinit();
+
             while (true) {
                 var request = http_server.receiveHead() catch |err| switch (err) {
                     error.HttpConnectionClosing => return,
                     else => return err,
                 };
-                self.handleHttpRequest(&request) catch continue;
+                self.handleHttpRequest(&parse_arena, &request) catch continue;
             }
         }
 
-        fn handleHttpRequest(self: *Self, request: *http.Server.Request) !void {
+        fn handleHttpRequest(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request) !void {
             switch (request.head.method) {
-                .POST => try self.handlePost(request),
+                .POST => try self.handlePost(parse_arena, request),
                 .DELETE => try self.handleDelete(request),
                 else => try request.respond("", .{ .status = .method_not_allowed }),
             }
@@ -98,7 +103,9 @@ pub fn HttpTransport(comptime Handler: type) type {
         // POST handler
         // =================================================================
 
-        fn handlePost(self: *Self, request: *http.Server.Request) !void {
+        fn handlePost(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request) !void {
+            defer _ = parse_arena.reset(.retain_capacity);
+
             // Single pass over headers before reading body (iterateHeaders requires received_head state)
             const headers = extractHeaders(request);
 
@@ -129,19 +136,18 @@ pub fn HttpTransport(comptime Handler: type) type {
                 });
             }
 
-            const parsed = json_rpc.parseMessage(self.allocator, body) catch {
+            const message = json_rpc.parseMessageWith(parse_arena, body) catch {
                 const err_bytes = try json_rpc.serializeError(self.allocator, null, .parse_error, null);
                 defer self.allocator.free(err_bytes);
                 return request.respond(err_bytes, .{
                     .extra_headers = &.{json_content_type},
                 });
             };
-            defer parsed.deinit();
 
             if (self.session) |*session| {
                 switch (session.state) {
-                    .awaiting_initialized => try self.handleAwaitingInitialized(parsed.value, request, session),
-                    .ready => try self.handleReady(parsed.value, request, &session.id),
+                    .awaiting_initialized => try self.handleAwaitingInitialized(message, request, session),
+                    .ready => try self.handleReady(message, request, &session.id),
                 }
             } else if (headers.session_id != null) {
                 return request.respond(
@@ -151,7 +157,7 @@ pub fn HttpTransport(comptime Handler: type) type {
                     .extra_headers = &.{json_content_type},
                 });
             } else {
-                try self.handlePreSession(parsed.value, request);
+                try self.handlePreSession(message, request);
             }
         }
 
@@ -236,7 +242,7 @@ pub fn HttpTransport(comptime Handler: type) type {
                     var writer = Io.Writer.fixed(&response_buf);
 
                     self.server.handleRequest(req, &writer) catch |err| {
-                        json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), &writer) catch {};
+                        json_rpc.sendError(req.id, .internal_error, @errorName(err), &writer) catch {};
                     };
 
                     const written = response_buf[0..writer.end];

@@ -12,19 +12,18 @@ const types = @import("types.zig");
 /// Passed to handler callbacks like `onReady` and `handlePermissionRequest`.
 /// Handlers may store this value for later use (e.g. to push channel events).
 pub const Context = struct {
-    allocator: Allocator,
     writer: *Io.Writer,
 
     pub fn sendChannelEvent(self: Context, params: types.ChannelEventParams) !void {
-        try json_rpc.sendNotification(self.allocator, types.channel_event_method, params, self.writer);
+        try json_rpc.sendNotification(types.channel_event_method, params, self.writer);
     }
 
     pub fn sendPermissionVerdict(self: Context, params: types.PermissionVerdictParams) !void {
-        try json_rpc.sendNotification(self.allocator, types.permission_verdict_method, params, self.writer);
+        try json_rpc.sendNotification(types.permission_verdict_method, params, self.writer);
     }
 
     pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
-        try json_rpc.sendNotification(self.allocator, method, params, self.writer);
+        try json_rpc.sendNotification(method, params, self.writer);
     }
 };
 
@@ -59,22 +58,27 @@ pub fn Server(comptime Handler: type) type {
     return struct {
         const Self = @This();
 
-        allocator: Allocator,
+        // Hot fields — accessed on every request dispatch
         handler: *Handler,
-        server_info: types.Implementation,
+        context: ?Context = null,
         capabilities: types.ServerCapabilities,
+
+        // Warm fields — accessed during initialization and response
+        server_info: types.Implementation,
         instructions: ?[]const u8,
+
+        // Cold fields — read once at startup
+        allocator: Allocator,
         read_buffer_size: usize,
         write_buffer_size: usize,
-        context: ?Context = null,
 
         pub fn init(allocator: Allocator, handler: *Handler, options: Options) Self {
             return .{
-                .allocator = allocator,
                 .handler = handler,
-                .server_info = options.server_info,
                 .capabilities = options.capabilities,
+                .server_info = options.server_info,
                 .instructions = options.instructions,
+                .allocator = allocator,
                 .read_buffer_size = options.read_buffer_size,
                 .write_buffer_size = options.write_buffer_size,
             };
@@ -108,17 +112,20 @@ pub fn Server(comptime Handler: type) type {
 
         /// Run the server with arbitrary reader/writer (useful for testing).
         pub fn run(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
-            self.context = .{ .allocator = self.allocator, .writer = writer };
+            self.context = .{ .writer = writer };
             defer self.context = null;
 
-            try self.handleInitialize(reader, writer);
-            try self.waitForInitialized(reader, writer);
+            var parse_arena = ArenaAllocator.init(self.allocator);
+            defer parse_arena.deinit();
+
+            try self.handleInitialize(&parse_arena, reader, writer);
+            try self.waitForInitialized(&parse_arena, reader, writer);
 
             if (comptime @hasDecl(Handler, "onReady")) {
                 self.handler.onReady(self.context.?);
             }
 
-            self.messageLoop(reader, writer) catch |err| switch (err) {
+            self.messageLoop(&parse_arena, reader, writer) catch |err| switch (err) {
                 error.EndOfStream, error.ReadFailed => return,
                 else => return err,
             };
@@ -128,24 +135,26 @@ pub fn Server(comptime Handler: type) type {
         // Lifecycle phases
         // =================================================================
 
-        fn handleInitialize(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn handleInitialize(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
+                defer _ = parse_arena.reset(.retain_capacity);
+
                 const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch {
-                    try json_rpc.sendError(self.allocator, null, .parse_error, null, writer);
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch {
+                    try json_rpc.sendError(null, .parse_error, null, writer);
                     continue;
                 };
-                defer parsed.deinit();
 
-                switch (parsed.value) {
+                switch (message) {
                     .request => |req| {
-                        if (mem.eql(u8, req.method, "initialize")) {
-                            try json_rpc.sendResult(self.allocator, req.id, self.initializeResult(), writer);
+                        const h = methodHash(req.method);
+                        if (h == comptime methodHash("initialize")) {
+                            try json_rpc.sendResult(req.id, self.initializeResult(), writer);
                             return;
-                        } else if (mem.eql(u8, req.method, "ping")) {
-                            try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+                        } else if (h == comptime methodHash("ping")) {
+                            try json_rpc.sendEmptyResult(req.id, writer);
                         } else {
-                            try json_rpc.sendError(self.allocator, req.id, .invalid_request, null, writer);
+                            try json_rpc.sendError(req.id, .invalid_request, null, writer);
                         }
                     },
                     .notification => {},
@@ -154,21 +163,22 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        fn waitForInitialized(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn waitForInitialized(_: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
-                const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch continue;
-                defer parsed.deinit();
+                defer _ = parse_arena.reset(.retain_capacity);
 
-                switch (parsed.value) {
+                const line = try json_rpc.readLine(reader);
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch continue;
+
+                switch (message) {
                     .notification => |notif| {
-                        if (mem.eql(u8, notif.method, "notifications/initialized")) {
+                        if (methodHash(notif.method) == comptime methodHash("notifications/initialized")) {
                             return;
                         }
                     },
                     .request => |req| {
-                        if (mem.eql(u8, req.method, "ping")) {
-                            try json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+                        if (methodHash(req.method) == comptime methodHash("ping")) {
+                            try json_rpc.sendEmptyResult(req.id, writer);
                         }
                     },
                     else => {},
@@ -176,23 +186,24 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        fn messageLoop(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn messageLoop(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
+                defer _ = parse_arena.reset(.retain_capacity);
+
                 const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch |err| {
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch |err| {
                     const code: json_rpc.ErrorCode = switch (err) {
                         error.InvalidJson => .parse_error,
                         else => .invalid_request,
                     };
-                    try json_rpc.sendError(self.allocator, null, code, null, writer);
+                    try json_rpc.sendError(null, code, null, writer);
                     continue;
                 };
-                defer parsed.deinit();
 
-                switch (parsed.value) {
+                switch (message) {
                     .request => |req| {
                         self.handleRequest(req, writer) catch |err| {
-                            json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), writer) catch {};
+                            json_rpc.sendError(req.id, .internal_error, @errorName(err), writer) catch {};
                         };
                     },
                     .notification => |notif| {
@@ -207,52 +218,55 @@ pub fn Server(comptime Handler: type) type {
         // Request routing
         // =================================================================
 
+        fn methodHash(name: []const u8) u64 {
+            return std.hash.Wyhash.hash(0, name);
+        }
+
         pub fn handleRequest(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
-            if (mem.eql(u8, req.method, "ping")) {
-                return json_rpc.sendEmptyResult(self.allocator, req.id, writer);
+            const hash = methodHash(req.method);
+
+            if (hash == comptime methodHash("ping")) {
+                return json_rpc.sendEmptyResult(req.id, writer);
             }
 
-            // Simple dispatch (no params)
             inline for (.{
                 .{ "tools/list", "listTools" },
                 .{ "resources/list", "listResources" },
                 .{ "prompts/list", "listPrompts" },
             }) |route| {
-                if (mem.eql(u8, req.method, route[0])) {
+                if (hash == comptime methodHash(route[0])) {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchSimple(req.id, route[1], writer);
                     }
-                    return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                    return json_rpc.sendError(req.id, .method_not_found, null, writer);
                 }
             }
 
-            // Dispatch with params
             inline for (.{
                 .{ "resources/read", "readResource", types.ReadResourceParams },
                 .{ "prompts/get", "getPrompt", types.GetPromptParams },
             }) |route| {
-                if (mem.eql(u8, req.method, route[0])) {
+                if (hash == comptime methodHash(route[0])) {
                     if (comptime @hasDecl(Handler, route[1])) {
                         return self.dispatchWithParams(req, route[1], route[2], writer);
                     }
-                    return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                    return json_rpc.sendError(req.id, .method_not_found, null, writer);
                 }
             }
 
-            // Tool call has special error handling (errors become isError=true results)
-            if (mem.eql(u8, req.method, "tools/call")) {
+            if (hash == comptime methodHash("tools/call")) {
                 if (comptime @hasDecl(Handler, "callTool")) {
                     return self.dispatchToolCall(req, writer);
                 }
-                return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+                return json_rpc.sendError(req.id, .method_not_found, null, writer);
             }
 
-            return json_rpc.sendError(self.allocator, req.id, .method_not_found, null, writer);
+            return json_rpc.sendError(req.id, .method_not_found, null, writer);
         }
 
         pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
             if (comptime @hasDecl(Handler, "handlePermissionRequest")) {
-                if (mem.eql(u8, notif.method, types.permission_request_method)) {
+                if (methodHash(notif.method) == comptime methodHash(types.permission_request_method)) {
                     const ctx = self.context orelse return;
                     const params = types.PermissionRequestParams.fromJson(notif.params orelse return) catch return;
                     self.handler.handlePermissionRequest(ctx, params);
@@ -270,9 +284,9 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const result = @field(Handler, method)(self.handler, arena.allocator()) catch |err| {
-                return json_rpc.sendError(self.allocator, id, .internal_error, @errorName(err), writer);
+                return json_rpc.sendError(id, .internal_error, @errorName(err), writer);
             };
-            try json_rpc.sendResult(self.allocator, id, result, writer);
+            try json_rpc.sendResult(id, result, writer);
         }
 
         fn dispatchWithParams(
@@ -286,19 +300,18 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const params = Params.fromJson(req.params orelse return json_rpc.sendError(
-                self.allocator,
                 req.id,
                 .invalid_params,
                 null,
                 writer,
             )) catch {
-                return json_rpc.sendError(self.allocator, req.id, .invalid_params, null, writer);
+                return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
             const result = @field(Handler, method)(self.handler, arena.allocator(), params) catch |err| {
-                return json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), writer);
+                return json_rpc.sendError(req.id, .internal_error, @errorName(err), writer);
             };
-            try json_rpc.sendResult(self.allocator, req.id, result, writer);
+            try json_rpc.sendResult(req.id, result, writer);
         }
 
         fn dispatchToolCall(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
@@ -306,13 +319,12 @@ pub fn Server(comptime Handler: type) type {
             defer arena.deinit();
 
             const params = types.CallToolParams.fromJson(req.params orelse return json_rpc.sendError(
-                self.allocator,
                 req.id,
                 .invalid_params,
                 null,
                 writer,
             )) catch {
-                return json_rpc.sendError(self.allocator, req.id, .invalid_params, null, writer);
+                return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
             const result = self.handler.callTool(arena.allocator(), params) catch |err| {
@@ -320,9 +332,9 @@ pub fn Server(comptime Handler: type) type {
                     .content = &.{types.Content.text_content(@errorName(err))},
                     .isError = true,
                 };
-                return json_rpc.sendResult(self.allocator, req.id, error_result, writer);
+                return json_rpc.sendResult(req.id, error_result, writer);
             };
-            try json_rpc.sendResult(self.allocator, req.id, result, writer);
+            try json_rpc.sendResult(req.id, result, writer);
         }
     };
 }
@@ -342,9 +354,11 @@ const TestHandler = struct {
         };
     }
 
-    pub fn callTool(_: *TestHandler, _: Allocator, params: types.CallToolParams) !types.CallToolResult {
+    pub fn callTool(_: *TestHandler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
         if (mem.eql(u8, params.name, "test_tool")) {
-            return .{ .content = &.{types.Content.text_content("hello")} };
+            const content = try allocator.alloc(types.Content, 1);
+            content[0] = types.Content.text_content("hello");
+            return .{ .content = content };
         }
         return error.ToolNotFound;
     }
