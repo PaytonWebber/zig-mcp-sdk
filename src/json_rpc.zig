@@ -225,6 +225,19 @@ pub fn parseMessage(allocator: Allocator, input: []const u8) MessageParseError!s
     };
 }
 
+/// Parse a message into a caller-owned arena. The caller is responsible for
+/// resetting or freeing the arena; parsed data borrows from it.
+pub fn parseMessageWith(arena: *ArenaAllocator, input: []const u8) MessageParseError!Message {
+    const value = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        input,
+        .{ .allocate = .alloc_always },
+    ) catch return error.InvalidJson;
+
+    return messageFromValue(value);
+}
+
 /// Parse a JSON-RPC 2.0 batch (array of messages) from a JSON byte string.
 /// Per the spec, an empty array is an invalid request.
 pub fn parseBatch(allocator: Allocator, input: []const u8) MessageParseError!std.json.Parsed([]Message) {

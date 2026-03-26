@@ -116,14 +116,17 @@ pub fn Server(comptime Handler: type) type {
             self.context = .{ .allocator = self.allocator, .writer = writer };
             defer self.context = null;
 
-            try self.handleInitialize(reader, writer);
-            try self.waitForInitialized(reader, writer);
+            var parse_arena = ArenaAllocator.init(self.allocator);
+            defer parse_arena.deinit();
+
+            try self.handleInitialize(&parse_arena, reader, writer);
+            try self.waitForInitialized(&parse_arena, reader, writer);
 
             if (comptime @hasDecl(Handler, "onReady")) {
                 self.handler.onReady(self.context.?);
             }
 
-            self.messageLoop(reader, writer) catch |err| switch (err) {
+            self.messageLoop(&parse_arena, reader, writer) catch |err| switch (err) {
                 error.EndOfStream, error.ReadFailed => return,
                 else => return err,
             };
@@ -133,16 +136,17 @@ pub fn Server(comptime Handler: type) type {
         // Lifecycle phases
         // =================================================================
 
-        fn handleInitialize(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn handleInitialize(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
+                defer _ = parse_arena.reset(.retain_capacity);
+
                 const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch {
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch {
                     try json_rpc.sendError(self.allocator, null, .parse_error, null, writer);
                     continue;
                 };
-                defer parsed.deinit();
 
-                switch (parsed.value) {
+                switch (message) {
                     .request => |req| {
                         const h = methodHash(req.method);
                         if (h == comptime methodHash("initialize")) {
@@ -160,13 +164,14 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        fn waitForInitialized(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn waitForInitialized(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
-                const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch continue;
-                defer parsed.deinit();
+                defer _ = parse_arena.reset(.retain_capacity);
 
-                switch (parsed.value) {
+                const line = try json_rpc.readLine(reader);
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch continue;
+
+                switch (message) {
                     .notification => |notif| {
                         if (methodHash(notif.method) == comptime methodHash("notifications/initialized")) {
                             return;
@@ -182,10 +187,12 @@ pub fn Server(comptime Handler: type) type {
             }
         }
 
-        fn messageLoop(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+        fn messageLoop(self: *Self, parse_arena: *ArenaAllocator, reader: *Io.Reader, writer: *Io.Writer) !void {
             while (true) {
+                defer _ = parse_arena.reset(.retain_capacity);
+
                 const line = try json_rpc.readLine(reader);
-                const parsed = json_rpc.parseMessage(self.allocator, line) catch |err| {
+                const message = json_rpc.parseMessageWith(parse_arena, line) catch |err| {
                     const code: json_rpc.ErrorCode = switch (err) {
                         error.InvalidJson => .parse_error,
                         else => .invalid_request,
@@ -193,9 +200,8 @@ pub fn Server(comptime Handler: type) type {
                     try json_rpc.sendError(self.allocator, null, code, null, writer);
                     continue;
                 };
-                defer parsed.deinit();
 
-                switch (parsed.value) {
+                switch (message) {
                     .request => |req| {
                         self.handleRequest(req, writer) catch |err| {
                             json_rpc.sendError(self.allocator, req.id, .internal_error, @errorName(err), writer) catch {};
