@@ -7,6 +7,27 @@ const Io = std.Io;
 const json_rpc = @import("json_rpc.zig");
 const types = @import("types.zig");
 
+/// Handle for sending server-initiated notifications (channel events, permission verdicts).
+///
+/// Passed to handler callbacks like `onReady` and `handlePermissionRequest`.
+/// Handlers may store this value for later use (e.g. to push channel events).
+pub const Context = struct {
+    allocator: Allocator,
+    writer: *Io.Writer,
+
+    pub fn sendChannelEvent(self: Context, params: types.ChannelEventParams) !void {
+        try json_rpc.sendNotification(self.allocator, types.channel_event_method, params, self.writer);
+    }
+
+    pub fn sendPermissionVerdict(self: Context, params: types.PermissionVerdictParams) !void {
+        try json_rpc.sendNotification(self.allocator, types.permission_verdict_method, params, self.writer);
+    }
+
+    pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
+        try json_rpc.sendNotification(self.allocator, method, params, self.writer);
+    }
+};
+
 /// Options for creating an MCP server.
 pub const Options = struct {
     server_info: types.Implementation,
@@ -27,6 +48,11 @@ pub const Options = struct {
 ///   fn listPrompts(*Handler, Allocator) !types.ListPromptsResult
 ///   fn getPrompt(*Handler, Allocator, types.GetPromptParams) !types.GetPromptResult
 ///
+/// Channel methods (for Claude Code channel servers):
+///
+///   fn onReady(*Handler, Context) void
+///   fn handlePermissionRequest(*Handler, Context, types.PermissionRequestParams) void
+///
 /// The Allocator passed to each handler is an arena scoped to the request;
 /// the handler may allocate freely from it.
 pub fn Server(comptime Handler: type) type {
@@ -40,6 +66,7 @@ pub fn Server(comptime Handler: type) type {
         instructions: ?[]const u8,
         read_buffer_size: usize,
         write_buffer_size: usize,
+        context: ?Context = null,
 
         pub fn init(allocator: Allocator, handler: *Handler, options: Options) Self {
             return .{
@@ -51,6 +78,12 @@ pub fn Server(comptime Handler: type) type {
                 .read_buffer_size = options.read_buffer_size,
                 .write_buffer_size = options.write_buffer_size,
             };
+        }
+
+        /// Returns the server context for sending notifications, or null if the
+        /// server is not yet running.
+        pub fn getContext(self: *const Self) ?Context {
+            return self.context;
         }
 
         pub fn initializeResult(self: *const Self) types.InitializeResult {
@@ -75,8 +108,16 @@ pub fn Server(comptime Handler: type) type {
 
         /// Run the server with arbitrary reader/writer (useful for testing).
         pub fn run(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
+            self.context = .{ .allocator = self.allocator, .writer = writer };
+            defer self.context = null;
+
             try self.handleInitialize(reader, writer);
             try self.waitForInitialized(reader, writer);
+
+            if (comptime @hasDecl(Handler, "onReady")) {
+                self.handler.onReady(self.context.?);
+            }
+
             self.messageLoop(reader, writer) catch |err| switch (err) {
                 error.EndOfStream, error.ReadFailed => return,
                 else => return err,
@@ -210,8 +251,14 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
-            _ = self;
-            _ = notif;
+            if (comptime @hasDecl(Handler, "handlePermissionRequest")) {
+                if (mem.eql(u8, notif.method, types.permission_request_method)) {
+                    const ctx = self.context orelse return;
+                    const params = types.PermissionRequestParams.fromJson(notif.params orelse return) catch return;
+                    self.handler.handlePermissionRequest(ctx, params);
+                    return;
+                }
+            }
         }
 
         // =================================================================
@@ -465,4 +512,87 @@ test "server handles invalid json gracefully" {
     const ping_parsed = try json_rpc.parseMessage(testing.allocator, ping_line);
     defer ping_parsed.deinit();
     try testing.expect(ping_parsed.value == .response);
+}
+
+// ============================================================================
+// Channel tests
+// ============================================================================
+
+const ChannelTestHandler = struct {
+    permission_request_received: bool = false,
+    ready_called: bool = false,
+    stored_ctx: ?Context = null,
+
+    pub fn onReady(self: *ChannelTestHandler, ctx: Context) void {
+        self.ready_called = true;
+        self.stored_ctx = ctx;
+    }
+
+    pub fn handlePermissionRequest(self: *ChannelTestHandler, ctx: Context, params: types.PermissionRequestParams) void {
+        self.permission_request_received = true;
+        ctx.sendPermissionVerdict(.{
+            .request_id = params.request_id,
+            .behavior = .allow,
+        }) catch {};
+    }
+};
+
+test "server calls onReady after initialization" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n";
+
+    var handler = ChannelTestHandler{};
+    var s = Server(ChannelTestHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-channel", .version = "0.1.0" },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var out_buf: [65536]u8 = undefined;
+    var writer = Io.Writer.fixed(&out_buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+
+    try testing.expect(handler.ready_called);
+    try testing.expect(handler.stored_ctx != null);
+}
+
+test "server dispatches permission request to handler" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/claude/channel/permission_request","params":{"request_id":"abcde","tool_name":"Bash","description":"Run ls","input_preview":"{}"}}
+    ++ "\n";
+
+    var handler = ChannelTestHandler{};
+    var s = Server(ChannelTestHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-channel", .version = "0.1.0" },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var result: TestOutput = .{};
+    var writer = Io.Writer.fixed(&result.buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+    result.len = writer.end;
+    const output = result.slice();
+
+    try testing.expect(handler.permission_request_received);
+
+    // Verify the verdict was sent (line after initialize response)
+    const verdict_line = getResponseLine(output, 1) orelse return error.MissingOutput;
+    const verdict_parsed = try json_rpc.parseMessage(testing.allocator, verdict_line);
+    defer verdict_parsed.deinit();
+    try testing.expect(verdict_parsed.value == .notification);
+    try testing.expectEqualStrings(types.permission_verdict_method, verdict_parsed.value.notification.method);
 }

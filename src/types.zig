@@ -60,6 +60,17 @@ pub const GetPromptParams = prompts_mod.GetPromptParams;
 pub const PromptMessage = prompts_mod.PromptMessage;
 pub const GetPromptResult = prompts_mod.GetPromptResult;
 
+// Channel
+const channel_mod = @import("types/channel.zig");
+pub const ChannelEventParams = channel_mod.ChannelEventParams;
+pub const PermissionBehavior = channel_mod.PermissionBehavior;
+pub const PermissionRequestParams = channel_mod.PermissionRequestParams;
+pub const PermissionVerdictParams = channel_mod.PermissionVerdictParams;
+pub const experimentalCapabilities = channel_mod.experimentalCapabilities;
+pub const channel_event_method = channel_mod.channel_event_method;
+pub const permission_request_method = channel_mod.permission_request_method;
+pub const permission_verdict_method = channel_mod.permission_verdict_method;
+
 // Logging
 pub const LoggingLevel = @import("types/logging.zig").LoggingLevel;
 

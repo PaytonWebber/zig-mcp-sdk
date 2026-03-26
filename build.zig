@@ -165,6 +165,31 @@ pub fn build(b: *std.Build) void {
     const http_example_step = b.step("example-http", "Build and run the HTTP greeter example");
     http_example_step.dependOn(&http_example_run_cmd.step);
 
+    // Example: channel MCP server
+    const channel_example_exe = b.addExecutable(.{
+        .name = "channel",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/channel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig_mcp_sdk", .module = mod },
+            },
+        }),
+    });
+
+    b.installArtifact(channel_example_exe);
+
+    const channel_example_run_cmd = b.addRunArtifact(channel_example_exe);
+    channel_example_run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        channel_example_run_cmd.addArgs(args);
+    }
+
+    const channel_example_step = b.step("example-channel", "Build and run the channel example");
+    channel_example_step.dependOn(&channel_example_run_cmd.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.
