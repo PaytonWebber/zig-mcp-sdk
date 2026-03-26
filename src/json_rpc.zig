@@ -393,6 +393,26 @@ pub const EmptyResult = struct {
     }
 };
 
+/// A JSON-RPC 2.0 notification with a comptime-known params type.
+/// Use for serializing typed notifications without converting to `std.json.Value`.
+pub fn GenericNotification(comptime Params: type) type {
+    return struct {
+        method: []const u8,
+        params: Params,
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.beginObject();
+            try jw.objectField("jsonrpc");
+            try jw.write(version);
+            try jw.objectField("method");
+            try jw.write(self.method);
+            try jw.objectField("params");
+            try jw.write(self.params);
+            try jw.endObject();
+        }
+    };
+}
+
 // ============================================================================
 // Serialization helpers — produce JSON-RPC response bytes
 // ============================================================================
@@ -402,6 +422,14 @@ pub fn serializeResult(allocator: Allocator, id: Id, result: anytype) ![]const u
     return std.json.Stringify.valueAlloc(allocator, GenericResponse(@TypeOf(result)){
         .result = result,
         .id = id,
+    }, json_stringify_options);
+}
+
+/// Serialize a JSON-RPC notification to bytes. Caller owns returned memory.
+pub fn serializeNotification(allocator: Allocator, method: []const u8, params: anytype) ![]const u8 {
+    return std.json.Stringify.valueAlloc(allocator, GenericNotification(@TypeOf(params)){
+        .method = method,
+        .params = params,
     }, json_stringify_options);
 }
 
@@ -427,6 +455,15 @@ pub fn sendResult(allocator: Allocator, id: Id, result: anytype, writer: *Io.Wri
 /// Write a JSON-RPC success response with an empty object result.
 pub fn sendEmptyResult(allocator: Allocator, id: Id, writer: *Io.Writer) !void {
     return sendResult(allocator, id, EmptyResult{}, writer);
+}
+
+/// Write a JSON-RPC notification and flush.
+pub fn sendNotification(allocator: Allocator, method: []const u8, params: anytype, writer: *Io.Writer) !void {
+    const bytes = try serializeNotification(allocator, method, params);
+    defer allocator.free(bytes);
+    try writer.writeAll(bytes);
+    try writer.writeByte('\n');
+    try writer.flush();
 }
 
 /// Write a JSON-RPC error response and flush.
@@ -809,4 +846,21 @@ test "params with null value treated as absent" {
     defer parsed.deinit();
 
     try testing.expect(parsed.value.request.params == null);
+}
+
+test "serializeNotification roundtrip" {
+    const TestParams = struct { content: []const u8 };
+    const bytes = try serializeNotification(
+        testing.allocator,
+        "notifications/test",
+        TestParams{ .content = "hello" },
+    );
+    defer testing.allocator.free(bytes);
+
+    const parsed = try parseMessage(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expect(parsed.value == .notification);
+    try testing.expectEqualStrings("notifications/test", parsed.value.notification.method);
+    try testing.expect(parsed.value.notification.params != null);
 }

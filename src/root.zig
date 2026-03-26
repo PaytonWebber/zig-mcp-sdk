@@ -8,6 +8,7 @@ pub const json_rpc = @import("json_rpc.zig");
 pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 pub const Server = server.Server;
+pub const Context = server.Context;
 pub const http_transport = @import("http_transport.zig");
 pub const HttpTransport = http_transport.HttpTransport;
 
