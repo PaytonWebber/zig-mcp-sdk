@@ -4,3 +4,4 @@ zig-out/
 CLAUDE.md
 docs/
 .mcp.json
+.rtk/
