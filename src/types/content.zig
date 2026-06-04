@@ -63,15 +63,46 @@ pub const EmbeddedResource = struct {
     }
 };
 
+/// A link to a resource the client can read separately (a tool may return these
+/// instead of embedding the content). Serialized with type tag `resource_link`.
+pub const ResourceLink = struct {
+    uri: []const u8,
+    name: []const u8,
+    title: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    mimeType: ?[]const u8 = null,
+    annotations: ?Annotations = null,
+
+    pub fn jsonStringify(self: ResourceLink, jw: anytype) !void {
+        try json_utils.stringifyWithTypeTag("resource_link", self, jw);
+    }
+};
+
 pub const Content = union(enum) {
     text: TextContent,
     image: ImageContent,
     audio: AudioContent,
     resource: EmbeddedResource,
+    resource_link: ResourceLink,
 
-    /// Convenience: create a text content item.
-    pub fn text_content(t: []const u8) Content {
+    /// Convenience constructor for a text content item.
+    pub fn textContent(t: []const u8) Content {
         return .{ .text = .{ .text = t } };
+    }
+
+    /// Convenience constructor for an image content item (base64 `data`).
+    pub fn imageContent(data: []const u8, mime_type: []const u8) Content {
+        return .{ .image = .{ .data = data, .mimeType = mime_type } };
+    }
+
+    /// Convenience constructor for an audio content item (base64 `data`).
+    pub fn audioContent(data: []const u8, mime_type: []const u8) Content {
+        return .{ .audio = .{ .data = data, .mimeType = mime_type } };
+    }
+
+    /// Deprecated: use `textContent`. Kept for backward compatibility.
+    pub fn text_content(t: []const u8) Content {
+        return textContent(t);
     }
 
     pub fn jsonStringify(self: Content, jw: anytype) !void {

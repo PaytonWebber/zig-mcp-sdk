@@ -32,6 +32,7 @@ pub const AudioContent = content_mod.AudioContent;
 pub const TextResourceContents = content_mod.TextResourceContents;
 pub const BlobResourceContents = content_mod.BlobResourceContents;
 pub const EmbeddedResource = content_mod.EmbeddedResource;
+pub const ResourceLink = content_mod.ResourceLink;
 pub const ResourceContents = content_mod.ResourceContents;
 pub const Content = content_mod.Content;
 
