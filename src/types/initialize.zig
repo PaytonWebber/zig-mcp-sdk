@@ -27,15 +27,14 @@ pub const InitializeParams = struct {
                     break :blk null;
                 },
             },
-            .clientInfo = .{
-                .name = blk: {
-                    const info = json_utils.asObject(obj.get("clientInfo") orelse break :blk "unknown") orelse break :blk "unknown";
-                    break :blk json_utils.getString(info, "name") orelse "unknown";
-                },
-                .version = blk: {
-                    const info = json_utils.asObject(obj.get("clientInfo") orelse break :blk "unknown") orelse break :blk "unknown";
-                    break :blk json_utils.getString(info, "version") orelse "unknown";
-                },
+            .clientInfo = blk: {
+                const info = json_utils.asObject(obj.get("clientInfo") orelse break :blk .{ .name = "unknown", .version = "unknown" }) orelse
+                    break :blk .{ .name = "unknown", .version = "unknown" };
+                break :blk .{
+                    .name = json_utils.getString(info, "name") orelse "unknown",
+                    .version = json_utils.getString(info, "version") orelse "unknown",
+                    .title = json_utils.getString(info, "title"),
+                };
             },
         };
     }

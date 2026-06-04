@@ -7,6 +7,7 @@
 // Core
 const core = @import("types/core.zig");
 pub const protocol_version = core.protocol_version;
+pub const supported_protocol_versions = core.supported_protocol_versions;
 pub const Implementation = core.Implementation;
 pub const Role = core.Role;
 pub const Annotations = core.Annotations;
@@ -70,6 +71,10 @@ pub const experimentalCapabilities = channel_mod.experimentalCapabilities;
 pub const channel_event_method = channel_mod.channel_event_method;
 pub const permission_request_method = channel_mod.permission_request_method;
 pub const permission_verdict_method = channel_mod.permission_verdict_method;
+
+// Schema generation + argument parsing
+pub const schemaForStruct = @import("types/schema.zig").schemaForStruct;
+pub const parseArgs = @import("types/json_utils.zig").parseArgs;
 
 // Logging
 pub const LoggingLevel = @import("types/logging.zig").LoggingLevel;

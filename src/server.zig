@@ -47,6 +47,11 @@ pub const Options = struct {
 ///   fn listPrompts(*Handler, Allocator) !types.ListPromptsResult
 ///   fn getPrompt(*Handler, Allocator, types.GetPromptParams) !types.GetPromptResult
 ///
+/// Lifecycle hook (optional), called after a successful `initialize` with the
+/// parsed client params (negotiated version, client capabilities, client info):
+///
+///   fn onInitialize(*Handler, types.InitializeParams) void
+///
 /// Channel methods (for Claude Code channel servers):
 ///
 ///   fn onReady(*Handler, Context) void
@@ -67,6 +72,11 @@ pub fn Server(comptime Handler: type) type {
         server_info: types.Implementation,
         instructions: ?[]const u8,
 
+        // Negotiated during `initialize` (valid only after the handshake).
+        negotiated_version: []const u8 = types.protocol_version,
+        client_capabilities: types.ClientCapabilities = .{},
+        client_info: ?types.Implementation = null,
+
         // Cold fields — read once at startup
         allocator: Allocator,
         read_buffer_size: usize,
@@ -84,6 +94,16 @@ pub fn Server(comptime Handler: type) type {
             };
         }
 
+        /// Negotiate the protocol version: echo the client's requested version
+        /// if this SDK supports it, otherwise the latest version we support
+        /// (per the spec's lifecycle rule).
+        fn negotiateVersion(requested: []const u8) []const u8 {
+            for (types.supported_protocol_versions) |v| {
+                if (std.mem.eql(u8, v, requested)) return v;
+            }
+            return types.protocol_version;
+        }
+
         /// Returns the server context for sending notifications, or null if the
         /// server is not yet running.
         pub fn getContext(self: *const Self) ?Context {
@@ -92,6 +112,7 @@ pub fn Server(comptime Handler: type) type {
 
         pub fn initializeResult(self: *const Self) types.InitializeResult {
             return .{
+                .protocolVersion = self.negotiated_version,
                 .capabilities = self.capabilities,
                 .serverInfo = self.server_info,
                 .instructions = self.instructions,
@@ -149,12 +170,27 @@ pub fn Server(comptime Handler: type) type {
                     .request => |req| {
                         const h = methodHash(req.method);
                         if (h == comptime methodHash("initialize")) {
+                            const params = types.InitializeParams.fromJson(req.params orelse {
+                                try json_rpc.sendError(req.id, .invalid_params, null, writer);
+                                continue;
+                            }) catch {
+                                try json_rpc.sendError(req.id, .invalid_params, null, writer);
+                                continue;
+                            };
+                            self.negotiated_version = negotiateVersion(params.protocolVersion);
+                            self.client_capabilities = params.capabilities;
+                            self.client_info = params.clientInfo;
+                            if (comptime @hasDecl(Handler, "onInitialize")) {
+                                self.handler.onInitialize(params);
+                            }
                             try json_rpc.sendResult(req.id, self.initializeResult(), writer);
                             return;
                         } else if (h == comptime methodHash("ping")) {
                             try json_rpc.sendEmptyResult(req.id, writer);
                         } else {
-                            try json_rpc.sendError(req.id, .invalid_request, null, writer);
+                            // Before initialize, only ping (and initialize) are
+                            // allowed; anything else is method_not_found.
+                            try json_rpc.sendError(req.id, .method_not_found, null, writer);
                         }
                     },
                     .notification => {},
@@ -202,8 +238,9 @@ pub fn Server(comptime Handler: type) type {
 
                 switch (message) {
                     .request => |req| {
-                        self.handleRequest(req, writer) catch |err| {
-                            json_rpc.sendError(req.id, .internal_error, @errorName(err), writer) catch {};
+                        self.handleRequest(req, writer) catch {
+                            // Don't leak internal Zig error names to the client.
+                            json_rpc.sendError(req.id, .internal_error, null, writer) catch {};
                         };
                     },
                     .notification => |notif| {
@@ -283,8 +320,8 @@ pub fn Server(comptime Handler: type) type {
             var arena = ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            const result = @field(Handler, method)(self.handler, arena.allocator()) catch |err| {
-                return json_rpc.sendError(id, .internal_error, @errorName(err), writer);
+            const result = @field(Handler, method)(self.handler, arena.allocator()) catch {
+                return json_rpc.sendError(id, .internal_error, null, writer);
             };
             try json_rpc.sendResult(id, result, writer);
         }
@@ -308,8 +345,8 @@ pub fn Server(comptime Handler: type) type {
                 return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
-            const result = @field(Handler, method)(self.handler, arena.allocator(), params) catch |err| {
-                return json_rpc.sendError(req.id, .internal_error, @errorName(err), writer);
+            const result = @field(Handler, method)(self.handler, arena.allocator(), params) catch {
+                return json_rpc.sendError(req.id, .internal_error, null, writer);
             };
             try json_rpc.sendResult(req.id, result, writer);
         }
@@ -327,9 +364,9 @@ pub fn Server(comptime Handler: type) type {
                 return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
-            const result = self.handler.callTool(arena.allocator(), params) catch |err| {
+            const result = self.handler.callTool(arena.allocator(), params) catch {
                 const error_result = types.CallToolResult{
-                    .content = &.{types.Content.text_content(@errorName(err))},
+                    .content = &.{types.Content.text_content("tool execution failed")},
                     .isError = true,
                 };
                 return json_rpc.sendResult(req.id, error_result, writer);
@@ -345,20 +382,28 @@ pub fn Server(comptime Handler: type) type {
 
 const testing = std.testing;
 
+const EchoArgs = struct {
+    name: []const u8 = "world",
+    pub const descriptions = .{ .name = "Who to greet" };
+};
+
 const TestHandler = struct {
     pub fn listTools(_: *TestHandler, _: Allocator) !types.ListToolsResult {
         return .{
             .tools = &.{
-                .{ .name = "test_tool", .description = "A test tool" },
+                .{
+                    .name = "test_tool",
+                    .description = "A test tool",
+                    .inputSchema = comptime types.schemaForStruct(EchoArgs),
+                },
             },
         };
     }
 
     pub fn callTool(_: *TestHandler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
         if (mem.eql(u8, params.name, "test_tool")) {
-            const content = try allocator.alloc(types.Content, 1);
-            content[0] = types.Content.text_content("hello");
-            return .{ .content = content };
+            const args = try types.parseArgs(EchoArgs, allocator, params.arguments);
+            return types.CallToolResult.text(allocator, try std.fmt.allocPrint(allocator, "hello {s}", .{args.name}));
         }
         return error.ToolNotFound;
     }
@@ -447,6 +492,29 @@ test "server handles tools/call" {
     try testing.expect(call_parsed.value.response.id.eql(.{ .integer = 3 }));
 }
 
+test "server emits comptime-generated schema and parses typed args" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/list","id":2}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/call","params":{"name":"test_tool","arguments":{"name":"ada"}},"id":3}
+    ++ "\n";
+
+    var result = try runTestServer(input);
+    const output = result.slice();
+
+    // tools/list carries the schema generated from EchoArgs at comptime.
+    const tools_line = getResponseLine(output, 1) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, tools_line, "\"name\":{\"type\":\"string\",\"description\":\"Who to greet\",\"default\":\"world\"}") != null);
+
+    // tools/call routed the typed argument through parseArgs.
+    const call_line = getResponseLine(output, 2) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, call_line, "hello ada") != null);
+}
+
 test "server handles tool call error as result" {
     const input =
         \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
@@ -501,6 +569,36 @@ test "server returns method_not_found for unknown methods" {
     defer err_parsed.deinit();
     try testing.expect(err_parsed.value == .error_response);
     try testing.expectEqual(@as(i32, -32601), err_parsed.value.error_response.@"error".code);
+}
+
+test "server echoes a supported requested protocol version" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}},"id":1}
+    ++ "\n";
+    var result = try runTestServer(input);
+    const line = getResponseLine(result.slice(), 0) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, line, "\"protocolVersion\":\"2025-06-18\"") != null);
+}
+
+test "server falls back to its latest version for an unsupported request" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"1.0.0","capabilities":{},"clientInfo":{"name":"t","version":"1"}},"id":1}
+    ++ "\n";
+    var result = try runTestServer(input);
+    const line = getResponseLine(result.slice(), 0) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, line, "\"protocolVersion\":\"2025-11-25\"") != null);
+}
+
+test "initialize without params is invalid_params" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","id":1}
+    ++ "\n";
+    var result = try runTestServer(input);
+    const line = getResponseLine(result.slice(), 0) orelse return error.MissingOutput;
+    const parsed = try json_rpc.parseMessage(testing.allocator, line);
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .error_response);
+    try testing.expectEqual(@as(i32, -32602), parsed.value.error_response.@"error".code);
 }
 
 test "server handles invalid json gracefully" {
