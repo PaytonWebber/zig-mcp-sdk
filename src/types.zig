@@ -1,4 +1,4 @@
-//! MCP protocol types — re-exports from domain-specific modules.
+//! MCP protocol types: re-exports from domain-specific modules.
 //!
 //! Each domain lives in its own file under `types/` for single-responsibility
 //! separation. This module provides a flat namespace so consumers can write

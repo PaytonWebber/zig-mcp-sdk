@@ -332,7 +332,7 @@ fn messageFromValue(value: std.json.Value) MessageParseError!Message {
             .result = obj.get("result").?,
         } };
     } else if (has_error) {
-        // Error response — id is required but may be null
+        // Error response, id is required but may be null.
         const err_val = obj.get("error").?;
         const err_obj = switch (err_val) {
             .object => |o| o,
@@ -427,7 +427,7 @@ pub fn GenericNotification(comptime Params: type) type {
 }
 
 // ============================================================================
-// Serialization helpers — produce JSON-RPC response bytes
+// Serialization helpers produce JSON-RPC response bytes.
 // ============================================================================
 
 /// Serialize a JSON-RPC success response to bytes. Caller owns returned memory.
@@ -453,7 +453,7 @@ pub fn serializeError(allocator: Allocator, id: ?Id, code: ErrorCode, data: ?[]c
 }
 
 // ============================================================================
-// Transport helpers — stream JSON-RPC messages directly to an Io.Writer
+// Transport helpers stream JSON-RPC messages directly to an Io.Writer.
 // ============================================================================
 
 /// Write a JSON-RPC success response and flush.
@@ -498,7 +498,7 @@ pub fn readLine(reader: *Io.Reader) ![]const u8 {
 // Tests
 // ============================================================================
 
-test "Id.eql — same type and value" {
+test "Id.eql, same type and value" {
     const a = Id{ .integer = 42 };
     const b = Id{ .integer = 42 };
     try testing.expect(a.eql(b));
@@ -508,7 +508,7 @@ test "Id.eql — same type and value" {
     try testing.expect(c.eql(d));
 }
 
-test "Id.eql — different value or type" {
+test "Id.eql, different value or type" {
     const a = Id{ .integer = 1 };
     const b = Id{ .integer = 2 };
     try testing.expect(!a.eql(b));
@@ -580,7 +580,7 @@ test "parse request with array params" {
     try testing.expect(req.params.? == .array);
 }
 
-test "parse notification — no id" {
+test "parse notification, no id" {
     const input =
         \\{"jsonrpc":"2.0","method":"update","params":{"key":"value"}}
     ;

@@ -143,7 +143,7 @@ pub fn parseFromJsonObject(comptime T: type, val: json.Value) error{InvalidParam
 const testing = std.testing;
 
 // Parse into the arena and run parseArgs against it. Zero-copy string slices
-// reference arena memory, so the arena must outlive the returned struct — this
+// reference arena memory, so the arena must outlive the returned struct. This
 // mirrors the request-scoped arena the server hands each handler.
 fn parseJson(comptime T: type, arena: std.mem.Allocator, text: []const u8) !T {
     const value = try json.parseFromSliceLeaky(json.Value, arena, text, .{});

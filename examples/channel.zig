@@ -1,4 +1,4 @@
-/// Simplified Claude Peers — peer discovery and messaging via the channel protocol.
+/// Simplified Claude Peers: peer discovery and messaging via the channel protocol.
 ///
 /// A self-contained implementation of the claude-peers pattern
 /// (github.com/louislva/claude-peers-mcp) demonstrating:
@@ -20,7 +20,7 @@ const Handler = struct {
     allocator: Allocator,
     ctx: ?mcp.Context = null,
     summary: []const u8 = "No summary set",
-    inbox: std.ArrayList(Message) = .{},
+    inbox: std.ArrayList(Message) = .empty,
 
     const Message = struct {
         from_id: []const u8,
@@ -104,10 +104,10 @@ const Handler = struct {
 
     fn listPeers(self: *Handler, allocator: Allocator) !types.CallToolResult {
         var peers = json.Array.init(allocator);
-        var peer = json.ObjectMap.init(allocator);
-        try peer.put("id", .{ .string = "self" });
-        try peer.put("summary", .{ .string = self.summary });
-        try peer.put("status", .{ .string = "active" });
+        var peer: json.ObjectMap = .empty;
+        try peer.put(allocator, "id", .{ .string = "self" });
+        try peer.put(allocator, "summary", .{ .string = self.summary });
+        try peer.put(allocator, "status", .{ .string = "active" });
         try peers.append(.{ .object = peer });
 
         const result = try json.Stringify.valueAlloc(
@@ -162,9 +162,9 @@ const Handler = struct {
         };
 
         for (0..count) |i| {
-            var meta = json.ObjectMap.init(allocator);
-            try meta.put("source", .{ .string = sim_sources[i % sim_sources.len] });
-            try meta.put("event_type", .{ .string = "webhook" });
+            var meta: json.ObjectMap = .empty;
+            try meta.put(allocator, "source", .{ .string = sim_sources[i % sim_sources.len] });
+            try meta.put(allocator, "event_type", .{ .string = "webhook" });
 
             ctx.sendChannelEvent(.{
                 .content = sim_events[i % sim_events.len],
@@ -185,8 +185,8 @@ const Handler = struct {
         while (self.inbox.items.len > 0) {
             const msg = self.inbox.orderedRemove(0);
 
-            var meta = json.ObjectMap.init(allocator);
-            try meta.put("from_id", .{ .string = msg.from_id });
+            var meta: json.ObjectMap = .empty;
+            try meta.put(allocator, "from_id", .{ .string = msg.from_id });
 
             ctx.sendChannelEvent(.{
                 .content = msg.text,

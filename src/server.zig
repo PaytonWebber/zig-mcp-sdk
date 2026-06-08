@@ -63,12 +63,12 @@ pub fn Server(comptime Handler: type) type {
     return struct {
         const Self = @This();
 
-        // Hot fields — accessed on every request dispatch
+        // Hot fields, accessed on every request dispatch.
         handler: *Handler,
         context: ?Context = null,
         capabilities: types.ServerCapabilities,
 
-        // Warm fields — accessed during initialization and response
+        // Warm fields, accessed during initialization and response.
         server_info: types.Implementation,
         instructions: ?[]const u8,
 
@@ -77,7 +77,7 @@ pub fn Server(comptime Handler: type) type {
         client_capabilities: types.ClientCapabilities = .{},
         client_info: ?types.Implementation = null,
 
-        // Cold fields — read once at startup
+        // Cold fields, read once at startup.
         allocator: Allocator,
         read_buffer_size: usize,
         write_buffer_size: usize,
@@ -117,6 +117,15 @@ pub fn Server(comptime Handler: type) type {
                 .serverInfo = self.server_info,
                 .instructions = self.instructions,
             };
+        }
+
+        pub fn applyInitializeParams(self: *Self, params: types.InitializeParams) void {
+            self.negotiated_version = negotiateVersion(params.protocolVersion);
+            self.client_capabilities = params.capabilities;
+            self.client_info = params.clientInfo;
+            if (comptime @hasDecl(Handler, "onInitialize")) {
+                self.handler.onInitialize(params);
+            }
         }
 
         /// Run the server over stdio. Blocks until stdin is closed.
@@ -177,12 +186,7 @@ pub fn Server(comptime Handler: type) type {
                                 try json_rpc.sendError(req.id, .invalid_params, null, writer);
                                 continue;
                             };
-                            self.negotiated_version = negotiateVersion(params.protocolVersion);
-                            self.client_capabilities = params.capabilities;
-                            self.client_info = params.clientInfo;
-                            if (comptime @hasDecl(Handler, "onInitialize")) {
-                                self.handler.onInitialize(params);
-                            }
+                            self.applyInitializeParams(params);
                             try json_rpc.sendResult(req.id, self.initializeResult(), writer);
                             return;
                         } else if (h == comptime methodHash("ping")) {
@@ -648,6 +652,34 @@ const ChannelTestHandler = struct {
         }) catch {};
     }
 };
+
+const InitHookHandler = struct {
+    initialized: bool = false,
+    requested_version: []const u8 = "",
+
+    pub fn onInitialize(self: *InitHookHandler, params: types.InitializeParams) void {
+        self.initialized = true;
+        self.requested_version = params.protocolVersion;
+    }
+};
+
+test "applyInitializeParams negotiates version and calls hook" {
+    var handler = InitHookHandler{};
+    var s = Server(InitHookHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-init", .version = "0.1.0" },
+    });
+
+    s.applyInitializeParams(.{
+        .protocolVersion = "2025-06-18",
+        .capabilities = .{},
+        .clientInfo = .{ .name = "client", .version = "1.0.0" },
+    });
+
+    try testing.expect(handler.initialized);
+    try testing.expectEqualStrings("2025-06-18", handler.requested_version);
+    try testing.expectEqualStrings("2025-06-18", s.negotiated_version);
+    try testing.expectEqualStrings("client", s.client_info.?.name);
+}
 
 test "server calls onReady after initialization" {
     const input =

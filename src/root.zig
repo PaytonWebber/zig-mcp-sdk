@@ -1,4 +1,4 @@
-//! Zig MCP SDK — Model Context Protocol implementation.
+//! Zig MCP SDK: Model Context Protocol implementation.
 //!
 //! - `json_rpc`: JSON-RPC 2.0 message types, parsing, and serialization.
 //! - `types`: MCP protocol types (capabilities, tools, resources, prompts, etc.).

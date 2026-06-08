@@ -59,4 +59,22 @@ pub const CallToolParams = struct {
 pub const CallToolResult = struct {
     content: []const Content,
     isError: ?bool = null,
+
+    /// Build a successful single-text result, allocating the content array from
+    /// `allocator` (use the request-scoped arena, never a stack array).
+    pub fn text(allocator: std.mem.Allocator, message: []const u8) !CallToolResult {
+        const items = try allocator.alloc(Content, 1);
+        items[0] = Content.text_content(message);
+        return .{ .content = items };
+    }
+
+    /// Build a tool-level error result (`isError = true`) carrying a single text
+    /// message. This is the MCP-correct way to report a tool failure (e.g. an
+    /// upstream API is down, or an id was not found). This is distinct from a JSON-RPC
+    /// protocol error, which is reserved for malformed/unroutable requests.
+    pub fn err(allocator: std.mem.Allocator, message: []const u8) !CallToolResult {
+        const items = try allocator.alloc(Content, 1);
+        items[0] = Content.text_content(message);
+        return .{ .content = items, .isError = true };
+    }
 };

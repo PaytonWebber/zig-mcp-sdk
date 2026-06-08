@@ -36,15 +36,15 @@ pub const PermissionVerdictParams = struct {
 /// Build the `experimental` capability value for channel servers.
 /// Pass `permission = true` to also declare permission relay support.
 pub fn experimentalCapabilities(allocator: Allocator, opts: struct { permission: bool = false }) !json.Value {
-    var map = json.ObjectMap.init(allocator);
-    errdefer map.deinit();
+    var map: json.ObjectMap = .empty;
+    errdefer map.deinit(allocator);
 
-    const channel_obj = json.ObjectMap.init(allocator);
-    try map.put("claude/channel", .{ .object = channel_obj });
+    const channel_obj: json.ObjectMap = .empty;
+    try map.put(allocator, "claude/channel", .{ .object = channel_obj });
 
     if (opts.permission) {
-        const perm_obj = json.ObjectMap.init(allocator);
-        try map.put("claude/channel/permission", .{ .object = perm_obj });
+        const perm_obj: json.ObjectMap = .empty;
+        try map.put(allocator, "claude/channel/permission", .{ .object = perm_obj });
     }
 
     return .{ .object = map };
@@ -57,10 +57,10 @@ pub fn experimentalCapabilities(allocator: Allocator, opts: struct { permission:
 const testing = std.testing;
 
 test "ChannelEventParams serializes with content and meta" {
-    var meta = json.ObjectMap.init(testing.allocator);
-    defer meta.deinit();
-    try meta.put("source", .{ .string = "test" });
-    try meta.put("severity", .{ .string = "high" });
+    var meta: json.ObjectMap = .empty;
+    defer meta.deinit(testing.allocator);
+    try meta.put(testing.allocator, "source", .{ .string = "test" });
+    try meta.put(testing.allocator, "severity", .{ .string = "high" });
 
     const params = ChannelEventParams{
         .content = "build failed",

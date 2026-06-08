@@ -169,6 +169,20 @@ pub fn HttpTransport(comptime Handler: type) type {
             switch (msg) {
                 .request => |req| {
                     if (mem.eql(u8, req.method, "initialize")) {
+                        const params = types.InitializeParams.fromJson(req.params orelse {
+                            const bytes = try json_rpc.serializeError(self.allocator, req.id, .invalid_params, null);
+                            defer self.allocator.free(bytes);
+                            return request.respond(bytes, .{
+                                .extra_headers = &.{json_content_type},
+                            });
+                        }) catch {
+                            const bytes = try json_rpc.serializeError(self.allocator, req.id, .invalid_params, null);
+                            defer self.allocator.free(bytes);
+                            return request.respond(bytes, .{
+                                .extra_headers = &.{json_content_type},
+                            });
+                        };
+                        self.server.applyInitializeParams(params);
                         const result = self.server.initializeResult();
                         const bytes = try json_rpc.serializeResult(self.allocator, req.id, result);
                         defer self.allocator.free(bytes);
