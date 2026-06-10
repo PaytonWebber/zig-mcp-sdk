@@ -7,8 +7,7 @@ not patched; upgrade to the newest release.
 
 ## Reporting a vulnerability
 
-Report privately via [GitHub security advisories](https://github.com/PaytonWebber/zig-mcp-sdk/security/advisories/new)
-or email payton@atcyrus.com. Please include a reproduction. You can expect an
+Report privately via [GitHub security advisories](https://github.com/PaytonWebber/zig-mcp-sdk/security/advisories/new). Please include a reproduction. You can expect an
 initial response within a week.
 
 Do not open public issues for vulnerabilities before a fix is released.
