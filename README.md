@@ -41,16 +41,15 @@ Requires Zig 0.16.0.
 
 ## What you ship
 
-[sqlite-mcp](https://github.com/PaytonWebber/sqlite-mcp) is a complete server built with this SDK: read-only SQLite access with tools, schema resources, and all of SQLite compiled in. Measured on the stripped `ReleaseSmall` x86_64-linux build:
+[sqlite-mcp](https://github.com/PaytonWebber/sqlite-mcp) is a complete server built with this SDK: read-only SQLite access with tools, schema resources, and all of SQLite compiled in. Measured against the reference Python server and the most-used npm equivalent: same machine, same database, same three-message session (initialize, initialized notification, one SELECT), three warm runs each.
 
-| | sqlite-mcp (this SDK) | typical Python MCP server | typical TypeScript MCP server |
+| | sqlite-mcp (this SDK) | mcp-server-sqlite (Python 3.14) | mcp-sqlite (Node 22) |
 |---|---|---|---|
-| Ships as | one static binary | virtualenv + interpreter | node_modules + Node.js |
-| Disk footprint | **1.0 MB** | tens of MB plus a Python install | tens of MB plus a Node install |
-| Cold start, handshake, first query | **under 10 ms** | interpreter startup | runtime startup |
-| Resident memory | **3.7 MB** | tens of MB | tens of MB |
+| What you install | one **1.0 MB** static binary | 33.5 MB venv, plus Python | 25.2 MB node_modules, plus Node.js |
+| Full session, cold process | **2 ms** | 410 ms | 210 ms |
+| Peak resident memory | **2.9 MB** | 64 MB | 84 MB |
 
-Users download one file and run `claude mcp add`. There is nothing else to install.
+The stripped `ReleaseSmall` x86_64-linux build. Users download one file and run `claude mcp add`; there is nothing else to install.
 
 ## Quick Start
 
