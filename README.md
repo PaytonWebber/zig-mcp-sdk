@@ -362,6 +362,7 @@ CI runs `zig build check` plus two conformance scripts: [`scripts/conformance.sh
 Built with this SDK:
 
 - [sqlite-mcp](https://github.com/PaytonWebber/sqlite-mcp): read-only SQLite access for AI agents in a single ~1 MB static binary
+- [agent-waymark](https://github.com/PaytonWebber/agent-waymark): durable shared working-state for agent orchestration; a daemon-backed MCP server (via `StatefulToolPack`) plus hooks that inject decisions, findings, and todos into every session
 
 ## License
 
