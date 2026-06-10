@@ -9,8 +9,12 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    env:
+      # Node 24 becomes the forced default on 2026-06-16; opt in now so
+      # breakage surfaces here instead of on the flip date.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: mlugg/setup-zig@v2
         with:
