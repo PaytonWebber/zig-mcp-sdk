@@ -3,6 +3,20 @@ const mcp = @import("zig_mcp_sdk");
 const types = mcp.types;
 const Allocator = std.mem.Allocator;
 
+const GreetArgs = struct {
+    name: []const u8,
+    pub const descriptions = .{ .name = "Name to greet" };
+};
+
+const MultiGreetArgs = struct {
+    name: []const u8,
+    count: u32 = 3,
+    pub const descriptions = .{
+        .name = "Name to greet",
+        .count = "Number of greetings",
+    };
+};
+
 const Handler = struct {
     pub fn listTools(_: *Handler, _: Allocator) !types.ListToolsResult {
         return .{
@@ -10,55 +24,34 @@ const Handler = struct {
                 .{
                     .name = "greet",
                     .description = "Greet someone by name",
-                    .inputSchema =
-                    \\{"type":"object","properties":{"name":{"type":"string","description":"Name to greet"}},"required":["name"]}
-                    ,
+                    .inputSchema = comptime types.schemaForStruct(GreetArgs),
                 },
                 .{
                     .name = "multi_greet",
                     .description = "Greet someone multiple times",
-                    .inputSchema =
-                    \\{"type":"object","properties":{"name":{"type":"string","description":"Name to greet"},"count":{"type":"integer","description":"Number of greetings","default":3}},"required":["name"]}
-                    ,
+                    .inputSchema = comptime types.schemaForStruct(MultiGreetArgs),
                 },
             },
         };
     }
 
     pub fn callTool(_: *Handler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
-        const args = if (params.arguments) |a| switch (a) {
-            .object => |o| o,
-            else => return error.InvalidParams,
-        } else return error.InvalidParams;
-
         if (std.mem.eql(u8, params.name, "greet")) {
-            const name = switch (args.get("name") orelse return error.InvalidParams) {
-                .string => |s| s,
-                else => return error.InvalidParams,
-            };
-            const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}! Welcome to the Zig MCP SDK.", .{name});
-            const content = try allocator.alloc(types.Content, 1);
-            content[0] = types.Content.text_content(greeting);
-            return .{ .content = content };
+            const args = try types.parseArgs(GreetArgs, allocator, params.arguments);
+            const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}! Welcome to the Zig MCP SDK.", .{args.name});
+            return types.CallToolResult.text(allocator, greeting);
         }
 
         if (std.mem.eql(u8, params.name, "multi_greet")) {
-            const name = switch (args.get("name") orelse return error.InvalidParams) {
-                .string => |s| s,
-                else => return error.InvalidParams,
-            };
-            const count: usize = blk: {
-                const val = args.get("count") orelse break :blk 3;
-                break :blk switch (val) {
-                    .integer => |i| if (i >= 1 and i <= 100) @intCast(i) else return error.InvalidParams,
-                    else => return error.InvalidParams,
-                };
-            };
+            const args = try types.parseArgs(MultiGreetArgs, allocator, params.arguments);
+            if (args.count < 1 or args.count > 100) {
+                return types.CallToolResult.err(allocator, "count must be between 1 and 100");
+            }
 
-            const content = try allocator.alloc(types.Content, count);
+            const content = try allocator.alloc(types.Content, args.count);
             for (content, 1..) |*item, i| {
                 item.* = types.Content.text_content(
-                    try std.fmt.allocPrint(allocator, "Greeting {d}: Hello, {s}!", .{ i, name }),
+                    try std.fmt.allocPrint(allocator, "Greeting {d}: Hello, {s}!", .{ i, args.name }),
                 );
             }
             return .{ .content = content };
@@ -66,18 +59,32 @@ const Handler = struct {
 
         return error.ToolNotFound;
     }
+
+    // Called per session once the client sends notifications/initialized.
+    // The context delivers notifications on the session's SSE stream (opened
+    // by the client with GET + Accept: text/event-stream).
+    pub fn onReady(_: *Handler, ctx: mcp.Context) void {
+        ctx.sendLogMessage(.{
+            .level = .info,
+            .logger = "greeter-http",
+            .data = .{ .string = "session ready" },
+        }) catch {}; // no SSE stream open yet is fine
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
+    // The HTTP transport handles connections concurrently, so the allocator
+    // must be thread-safe (init.arena is not).
+    const allocator = std.heap.smp_allocator;
 
     var handler = Handler{};
     var server = mcp.Server(Handler).init(allocator, &handler, .{
         .server_info = .{ .name = "greeter-http", .version = "0.1.0" },
-        .capabilities = .{ .tools = .{} },
+        .capabilities = .{ .tools = .{}, .logging = .{} },
         .instructions = "A friendly greeter server over HTTP.",
     });
 
     var transport = mcp.HttpTransport(Handler).init(allocator, &server, .{ .port = 8080 });
+    defer transport.deinit();
     try transport.listen(init.io);
 }

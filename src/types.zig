@@ -11,6 +11,15 @@ pub const supported_protocol_versions = core.supported_protocol_versions;
 pub const Implementation = core.Implementation;
 pub const Role = core.Role;
 pub const Annotations = core.Annotations;
+pub const ListParams = core.ListParams;
+
+// Cancellation + progress
+const notifications_mod = @import("types/notifications.zig");
+pub const TokenValue = notifications_mod.TokenValue;
+pub const CancelledParams = notifications_mod.CancelledParams;
+pub const ProgressParams = notifications_mod.ProgressParams;
+pub const cancelled_method = notifications_mod.cancelled_method;
+pub const progress_method = notifications_mod.progress_method;
 
 // Capabilities
 const caps = @import("types/capabilities.zig");

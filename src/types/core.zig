@@ -25,6 +25,25 @@ pub const Role = enum {
     assistant,
 };
 
+/// Params for paginated list requests (`tools/list`, `resources/list`,
+/// `prompts/list`). The cursor is an opaque token from a previous result's
+/// `nextCursor`.
+pub const ListParams = struct {
+    cursor: ?[]const u8 = null,
+
+    pub fn fromJson(val: @import("std").json.Value) error{InvalidParams}!ListParams {
+        const obj = json_utils.asObject(val) orelse return error.InvalidParams;
+        const c = obj.get("cursor") orelse return .{};
+        return switch (c) {
+            .string => |s| .{ .cursor = s },
+            .null => .{},
+            else => error.InvalidParams,
+        };
+    }
+};
+
+const json_utils = @import("json_utils.zig");
+
 pub const Annotations = struct {
     audience: ?[]const Role = null,
     priority: ?f64 = null,

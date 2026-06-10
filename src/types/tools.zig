@@ -50,11 +50,22 @@ pub const ListToolsResult = struct {
 pub const CallToolParams = struct {
     name: []const u8,
     arguments: ?json.Value = null,
+    _meta: ?json.Value = null,
 
     pub fn fromJson(val: json.Value) error{InvalidParams}!CallToolParams {
         return json_utils.parseFromJsonObject(CallToolParams, val);
     }
+
+    /// The progress token from `_meta.progressToken`, if the client sent one.
+    /// Echo it in `Context.sendProgress` while the call is running.
+    pub fn progressToken(self: CallToolParams) ?notifications.TokenValue {
+        const obj = json_utils.asObject(self._meta) orelse return null;
+        const val = obj.get("progressToken") orelse return null;
+        return notifications.TokenValue.fromJson(val);
+    }
 };
+
+const notifications = @import("notifications.zig");
 
 pub const CallToolResult = struct {
     content: []const Content,

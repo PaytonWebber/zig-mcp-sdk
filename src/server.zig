@@ -7,29 +7,61 @@ const Io = std.Io;
 const json_rpc = @import("json_rpc.zig");
 const types = @import("types.zig");
 
-/// Handle for sending server-initiated notifications (channel events, permission verdicts).
+/// Handle for sending server-initiated notifications (log messages, progress,
+/// channel events, permission verdicts).
 ///
 /// Passed to handler callbacks like `onReady` and `handlePermissionRequest`.
 /// Handlers may store this value for later use (e.g. to push channel events).
+///
+/// The sink abstracts the transport: stdio writes line-delimited JSON to the
+/// output stream; HTTP delivers each notification as a server-sent event on
+/// the session's open GET stream.
 pub const Context = struct {
-    writer: *Io.Writer,
+    sink: Sink,
+
+    pub const Sink = union(enum) {
+        /// Line-delimited JSON-RPC over a stream (stdio transport).
+        writer: *Io.Writer,
+        /// Transport-owned delivery (e.g. SSE over HTTP). `send` receives one
+        /// serialized JSON-RPC notification, without a trailing newline.
+        custom: Custom,
+    };
+
+    pub const Custom = struct {
+        ptr: *anyopaque,
+        allocator: Allocator,
+        send: *const fn (ptr: *anyopaque, message: []const u8) anyerror!void,
+    };
+
+    pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
+        switch (self.sink) {
+            .writer => |w| try json_rpc.sendNotification(method, params, w),
+            .custom => |c| {
+                const bytes = try json_rpc.serializeNotification(c.allocator, method, params);
+                defer c.allocator.free(bytes);
+                try c.send(c.ptr, bytes);
+            },
+        }
+    }
 
     pub fn sendChannelEvent(self: Context, params: types.ChannelEventParams) !void {
-        try json_rpc.sendNotification(types.channel_event_method, params, self.writer);
+        try self.sendNotification(types.channel_event_method, params);
     }
 
     pub fn sendPermissionVerdict(self: Context, params: types.PermissionVerdictParams) !void {
-        try json_rpc.sendNotification(types.permission_verdict_method, params, self.writer);
-    }
-
-    pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
-        try json_rpc.sendNotification(method, params, self.writer);
+        try self.sendNotification(types.permission_verdict_method, params);
     }
 
     /// Send a `notifications/message` log entry to the client.
     /// Declare `.logging = .{}` in the server capabilities when using this.
     pub fn sendLogMessage(self: Context, params: types.LogMessageParams) !void {
-        try json_rpc.sendNotification(types.log_message_method, params, self.writer);
+        try self.sendNotification(types.log_message_method, params);
+    }
+
+    /// Send a `notifications/progress` update for a long-running request.
+    /// Echo the token from `CallToolParams.progressToken()`.
+    pub fn sendProgress(self: Context, params: types.ProgressParams) !void {
+        try self.sendNotification(types.progress_method, params);
     }
 };
 
@@ -53,6 +85,10 @@ pub const Options = struct {
 ///   fn listPrompts(*Handler, Allocator) !types.ListPromptsResult
 ///   fn getPrompt(*Handler, Allocator, types.GetPromptParams) !types.GetPromptResult
 ///   fn setLoggingLevel(*Handler, types.LoggingLevel) void
+///   fn onCancelled(*Handler, types.CancelledParams) void
+///
+/// List methods may instead take `(*Handler, Allocator, types.ListParams)` to
+/// receive the pagination cursor; the arity is detected at comptime.
 ///
 /// Lifecycle hook (optional), called after a successful `initialize` with the
 /// parsed client params (negotiated version, client capabilities, client info):
@@ -104,7 +140,7 @@ pub fn Server(comptime Handler: type) type {
         /// Negotiate the protocol version: echo the client's requested version
         /// if this SDK supports it, otherwise the latest version we support
         /// (per the spec's lifecycle rule).
-        fn negotiateVersion(requested: []const u8) []const u8 {
+        pub fn negotiateVersion(requested: []const u8) []const u8 {
             for (types.supported_protocol_versions) |v| {
                 if (std.mem.eql(u8, v, requested)) return v;
             }
@@ -149,7 +185,7 @@ pub fn Server(comptime Handler: type) type {
 
         /// Run the server with arbitrary reader/writer (useful for testing).
         pub fn run(self: *Self, reader: *Io.Reader, writer: *Io.Writer) !void {
-            self.context = .{ .writer = writer };
+            self.context = .{ .sink = .{ .writer = writer } };
             defer self.context = null;
 
             var parse_arena = ArenaAllocator.init(self.allocator);
@@ -284,7 +320,7 @@ pub fn Server(comptime Handler: type) type {
             }) |route| {
                 if (hash == comptime methodHash(route[0])) {
                     if (comptime @hasDecl(Handler, route[1])) {
-                        return self.dispatchSimple(req.id, route[1], writer);
+                        return self.dispatchList(req, route[1], writer);
                     }
                     return json_rpc.sendError(req.id, .method_not_found, null, writer);
                 }
@@ -320,8 +356,18 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn handleNotification(self: *Self, notif: json_rpc.Notification) void {
+            const hash = methodHash(notif.method);
+
+            if (comptime @hasDecl(Handler, "onCancelled")) {
+                if (hash == comptime methodHash(types.cancelled_method)) {
+                    const params = types.CancelledParams.fromJson(notif.params orelse return) catch return;
+                    self.handler.onCancelled(params);
+                    return;
+                }
+            }
+
             if (comptime @hasDecl(Handler, "handlePermissionRequest")) {
-                if (methodHash(notif.method) == comptime methodHash(types.permission_request_method)) {
+                if (hash == comptime methodHash(types.permission_request_method)) {
                     const ctx = self.context orelse return;
                     const params = types.PermissionRequestParams.fromJson(notif.params orelse return) catch return;
                     self.handler.handlePermissionRequest(ctx, params);
@@ -334,14 +380,30 @@ pub fn Server(comptime Handler: type) type {
         // Dispatch helpers
         // =================================================================
 
-        fn dispatchSimple(self: *Self, id: json_rpc.Id, comptime method: []const u8, writer: *Io.Writer) !void {
+        /// Dispatch a list method. Handlers may take `(self, Allocator)` or, to
+        /// receive the pagination cursor, `(self, Allocator, types.ListParams)`;
+        /// the arity is detected at comptime.
+        fn dispatchList(self: *Self, req: json_rpc.Request, comptime method: []const u8, writer: *Io.Writer) !void {
             var arena = ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            const result = @field(Handler, method)(self.handler, arena.allocator()) catch {
-                return json_rpc.sendError(id, .internal_error, null, writer);
+            const func = @field(Handler, method);
+            const takes_params = @typeInfo(@TypeOf(func)).@"fn".params.len == 3;
+
+            const result = if (comptime takes_params) blk: {
+                const params: types.ListParams = if (req.params) |p|
+                    types.ListParams.fromJson(p) catch {
+                        return json_rpc.sendError(req.id, .invalid_params, null, writer);
+                    }
+                else
+                    .{};
+                break :blk func(self.handler, arena.allocator(), params) catch {
+                    return json_rpc.sendError(req.id, .internal_error, null, writer);
+                };
+            } else func(self.handler, arena.allocator()) catch {
+                return json_rpc.sendError(req.id, .internal_error, null, writer);
             };
-            try json_rpc.sendResult(id, result, writer);
+            try json_rpc.sendResult(req.id, result, writer);
         }
 
         fn dispatchWithParams(
@@ -656,6 +718,141 @@ test "server handles invalid json gracefully" {
     const ping_parsed = try json_rpc.parseMessage(testing.allocator, ping_line);
     defer ping_parsed.deinit();
     try testing.expect(ping_parsed.value == .response);
+}
+
+const PaginatedHandler = struct {
+    pub fn listTools(_: *PaginatedHandler, allocator: Allocator, params: types.ListParams) !types.ListToolsResult {
+        if (params.cursor) |cursor| {
+            if (mem.eql(u8, cursor, "page2")) {
+                const tools = try allocator.alloc(types.Tool, 1);
+                tools[0] = .{ .name = "second_tool" };
+                return .{ .tools = tools };
+            }
+            return error.InvalidCursor;
+        }
+        const tools = try allocator.alloc(types.Tool, 1);
+        tools[0] = .{ .name = "first_tool" };
+        return .{ .tools = tools, .nextCursor = "page2" };
+    }
+};
+
+test "list handler with ListParams receives the pagination cursor" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/list","id":2}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":"page2"},"id":3}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/list","params":{"cursor":42},"id":4}
+    ++ "\n";
+
+    var handler = PaginatedHandler{};
+    var s = Server(PaginatedHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-paginated", .version = "0.1.0" },
+        .capabilities = .{ .tools = .{} },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var result: TestOutput = .{};
+    var writer = Io.Writer.fixed(&result.buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+    result.len = writer.end;
+    const output = result.slice();
+
+    const first = getResponseLine(output, 1) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, first, "\"first_tool\"") != null);
+    try testing.expect(mem.indexOf(u8, first, "\"nextCursor\":\"page2\"") != null);
+
+    const second = getResponseLine(output, 2) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, second, "\"second_tool\"") != null);
+    try testing.expect(mem.indexOf(u8, second, "nextCursor") == null);
+
+    // Non-string cursor is invalid_params.
+    const third = getResponseLine(output, 3) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, third, "-32602") != null);
+}
+
+const CancellableHandler = struct {
+    cancelled_integer_id: ?i64 = null,
+    reason_matched: bool = false,
+
+    // Params slices are request-scoped; inspect or copy them inside the
+    // callback, never store them.
+    pub fn onCancelled(self: *CancellableHandler, params: types.CancelledParams) void {
+        self.cancelled_integer_id = switch (params.requestId) {
+            .integer => |i| i,
+            .string => null,
+        };
+        self.reason_matched = params.reason != null and mem.eql(u8, params.reason.?, "too slow");
+    }
+};
+
+test "server routes notifications/cancelled to onCancelled" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9,"reason":"too slow"}}
+    ++ "\n";
+
+    var handler = CancellableHandler{};
+    var s = Server(CancellableHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-cancel", .version = "0.1.0" },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var out_buf: [65536]u8 = undefined;
+    var writer = Io.Writer.fixed(&out_buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+
+    try testing.expectEqual(@as(i64, 9), handler.cancelled_integer_id.?);
+    try testing.expect(handler.reason_matched);
+}
+
+test "Context.sendProgress writes a progress notification" {
+    var out_buf: [4096]u8 = undefined;
+    var writer = Io.Writer.fixed(&out_buf);
+    const ctx = Context{ .sink = .{ .writer = &writer } };
+
+    try ctx.sendProgress(.{
+        .progressToken = .{ .string = "tok-1" },
+        .progress = 0.5,
+        .total = 1.0,
+        .message = "halfway",
+    });
+
+    const written = out_buf[0..writer.end];
+    try testing.expect(mem.indexOf(u8, written, "\"method\":\"notifications/progress\"") != null);
+    try testing.expect(mem.indexOf(u8, written, "\"progressToken\":\"tok-1\"") != null);
+    try testing.expect(mem.indexOf(u8, written, "\"message\":\"halfway\"") != null);
+}
+
+test "CallToolParams.progressToken extracts the _meta token" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"name":"t","arguments":{},"_meta":{"progressToken":7}}
+    , .{});
+    const params = try types.CallToolParams.fromJson(val);
+    try testing.expect(params.progressToken().?.eql(.{ .integer = 7 }));
+
+    const bare = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"name":"t"}
+    , .{});
+    const bare_params = try types.CallToolParams.fromJson(bare);
+    try testing.expect(bare_params.progressToken() == null);
 }
 
 test "server without setLoggingLevel returns method_not_found" {

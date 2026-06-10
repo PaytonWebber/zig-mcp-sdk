@@ -136,10 +136,25 @@ Implement only what your server supports and declare the matching capabilities.
 | `listPrompts` | `fn(*Handler, Allocator) !ListPromptsResult` | `.prompts = .{}` |
 | `getPrompt` | `fn(*Handler, Allocator, GetPromptParams) !GetPromptResult` | `.prompts = .{}` |
 | `setLoggingLevel` | `fn(*Handler, LoggingLevel) void` | `.logging = .{}` |
+| `onCancelled` | `fn(*Handler, CancelledParams) void` | none |
 
-The `Allocator` passed to each handler is an arena scoped to the request. Allocate freely from it; memory is released after the response is sent.
+List handlers may instead take `(*Handler, Allocator, ListParams)` to receive the pagination cursor; the arity is detected at compile time. Return `nextCursor` in the result to signal more pages.
+
+The `Allocator` passed to each handler is an arena scoped to the request. Allocate freely from it; memory is released after the response is sent. Slices in params are request-scoped too: copy them if you keep them past the handler call.
 
 If `callTool` returns an error, the client receives a tool result with `isError: true` rather than a JSON-RPC error, as the MCP spec requires.
+
+### Server-initiated notifications
+
+Handlers that declare `onReady(*Handler, mcp.Context)` receive a `Context` once the client completes the handshake. Use it to push notifications:
+
+```zig
+ctx.sendLogMessage(.{ .level = .info, .data = .{ .string = "ready" } });
+ctx.sendProgress(.{ .progressToken = token, .progress = 0.5, .total = 1.0 });
+ctx.sendNotification("notifications/tools/list_changed", .{});
+```
+
+For progress, echo the token from `CallToolParams.progressToken()` (sent by the client in `_meta.progressToken`). Over stdio, notifications interleave with responses on stdout. Over HTTP, they are delivered as server-sent events on the session's GET stream.
 
 ### Schema generation
 
@@ -176,15 +191,21 @@ mcp.HttpTransport(Handler).init(allocator, &server, .{
     .address = "127.0.0.1",       // default, use "0.0.0.0" for all interfaces
     .max_body_size = 1024 * 1024, // reject larger POST bodies with 413
     .allowed_origins = &.{},      // extra origins beyond localhost
+    .max_sessions = 64,           // new initialize beyond this gets 503
+    .sse_keepalive_seconds = 15,  // keepalive interval on SSE streams
 });
 ```
 
 The HTTP transport implements the [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) protocol:
 
-- `POST /` for JSON-RPC messages, `DELETE /` to terminate the session
+- `POST /` for JSON-RPC messages, `GET /` with `Accept: text/event-stream` for the server-to-client event stream, `DELETE /` to terminate the session
+- Multiple concurrent sessions, each negotiating its own protocol version, with connections handled in parallel
 - Session management via `Mcp-Session-Id` headers, IDs from the OS CSPRNG
+- Server-initiated notifications (logging, progress, channel events) delivered as SSE events on the session's GET stream, with periodic keepalives
 - `Content-Type` and `Accept` validation
 - Origin header validation against localhost plus `allowed_origins`, which blocks DNS rebinding attacks. Non-browser clients that send no Origin header always pass.
+
+Connections are handled concurrently, so the allocator passed to `init` (and to the `Server`) must be thread-safe, and handler methods must tolerate concurrent calls. `std.heap.smp_allocator` works well; per-request arenas are still created for you.
 
 ## Connecting to Clients
 
@@ -250,7 +271,7 @@ zig build example      # build and run the stdio greeter example
 zig build example-http # build and run the HTTP greeter example
 ```
 
-CI runs `zig build check` plus an MCP conformance script ([`scripts/conformance.sh`](scripts/conformance.sh)) that drives the greeter binary through a full stdio session: handshake, ping, tool calls, resources, prompts, error codes, and parse-error recovery.
+CI runs `zig build check` plus two conformance scripts: [`scripts/conformance.sh`](scripts/conformance.sh) drives the greeter binary through a full stdio session (handshake, ping, tool calls, resources, prompts, error codes, parse-error recovery), and [`scripts/conformance_http.sh`](scripts/conformance_http.sh) exercises the HTTP transport with curl (concurrent sessions, SSE event delivery, security rejections, session termination).
 
 ## Versioning
 

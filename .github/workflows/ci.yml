@@ -26,5 +26,8 @@ jobs:
       - name: Install example binaries
         run: zig build examples
 
-      - name: MCP conformance check
+      - name: MCP stdio conformance check
         run: ./scripts/conformance.sh
+
+      - name: MCP Streamable HTTP conformance check
+        run: ./scripts/conformance_http.sh
