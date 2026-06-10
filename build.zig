@@ -40,6 +40,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    const docs_obj = b.addObject(.{ .name = "zig_mcp_sdk", .root_module = mcp_mod });
+    const docs_step = b.step("docs", "Generate API documentation into zig-out/docs");
+    docs_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    }).step);
+
     const check_step = b.step("check", "Run tests, format checks, and compile examples");
     check_step.dependOn(test_step);
     check_step.dependOn(&fmt.step);

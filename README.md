@@ -37,7 +37,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build 
 - No dependencies beyond the Zig standard library
 - Conformance-tested in CI over both transports
 
-Requires Zig 0.16.0.
+Requires Zig 0.16.0. [API documentation](https://paytonwebber.github.io/zig-mcp-sdk/) is generated from source on every push.
 
 ## What you ship
 
@@ -50,6 +50,8 @@ Requires Zig 0.16.0.
 | Peak resident memory | **2.9 MB** | 64 MB | 84 MB |
 
 The stripped `ReleaseSmall` x86_64-linux build. Users download one file and run `claude mcp add`; there is nothing else to install.
+
+**When to use this.** If your tools are already Python or TypeScript, use the official SDKs; they are mature and their ecosystems are bigger. This SDK is for when the server itself should be a small, fast artifact: a tool you distribute to end users as one file, run in constrained environments, or start often enough that runtime startup matters.
 
 ## Quick Start
 
@@ -265,7 +267,13 @@ Connections are handled concurrently, so the allocator passed to `init` (and to 
 
 ## Connecting to Clients
 
-### Claude Desktop / Claude Code / Cursor (stdio)
+### Claude Code (stdio)
+
+```bash
+claude mcp add my-server /path/to/my-server
+```
+
+### Claude Desktop / Cursor (stdio)
 
 ```json
 {
