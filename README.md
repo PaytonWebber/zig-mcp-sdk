@@ -1,10 +1,31 @@
 # zig-mcp-sdk
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build MCP servers that expose tools, resources, and prompts to AI agents.
+[![CI](https://github.com/PaytonWebber/zig-mcp-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/PaytonWebber/zig-mcp-sdk/actions/workflows/ci.yml)
 
-Supports both **stdio** (local) and **Streamable HTTP** (remote) transports.
+Define a Zig struct, get an MCP tool schema at compile time. No JSON schema strings, no runtime reflection cost.
 
-**Requires Zig 0.16.0**.
+```zig
+const HelloArgs = struct {
+    name: []const u8,
+    pub const descriptions = .{ .name = "Name to greet" };
+};
+
+// In listTools:
+.inputSchema = comptime types.schemaForStruct(HelloArgs),
+
+// In callTool:
+const args = try types.parseArgs(HelloArgs, allocator, params.arguments);
+```
+
+A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build servers that expose tools, resources, and prompts to AI agents over **stdio** (local) or **Streamable HTTP** (remote).
+
+- One struct drives both the tool schema and typed argument parsing
+- Request-scoped arena allocators: allocate freely in handlers, freed after the response
+- Zero-copy strings: parsed slices point into arena memory, no duplication
+- Handler methods resolved at comptime via `@hasDecl`, no vtables
+- No dependencies beyond the Zig standard library
+
+Requires Zig 0.16.0.
 
 ## Quick Start
 
@@ -25,9 +46,9 @@ const mcp_dep = b.dependency("zig_mcp_sdk", .{
 exe.root_module.addImport("zig_mcp_sdk", mcp_dep.module("zig_mcp_sdk"));
 ```
 
-### 2. Define a Handler
+### 2. Define a handler
 
-A Handler is a struct that implements the MCP methods you want to support. All methods are optional. Implement only what you need.
+A handler is a plain struct that implements the MCP methods you want to support. All methods are optional.
 
 ```zig
 const std = @import("std");
@@ -67,7 +88,7 @@ const MyHandler = struct {
 
 ### 3. Start the server
 
-**Stdio transport** (for Claude Desktop, Cursor, etc.):
+Stdio transport (Claude Desktop, Claude Code, Cursor):
 
 ```zig
 pub fn main(init: std.process.Init) !void {
@@ -83,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-**HTTP transport** (for remote/cloud deployment):
+HTTP transport (remote or cloud deployment):
 
 ```zig
 pub fn main(init: std.process.Init) !void {
@@ -104,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
 
 ## Handler Methods
 
-All methods are optional. Implement only what your server supports, and declare matching capabilities in the server options.
+Implement only what your server supports and declare the matching capabilities.
 
 | Method | Signature | Capability |
 |--------|-----------|------------|
@@ -114,23 +135,28 @@ All methods are optional. Implement only what your server supports, and declare 
 | `readResource` | `fn(*Handler, Allocator, ReadResourceParams) !ReadResourceResult` | `.resources = .{}` |
 | `listPrompts` | `fn(*Handler, Allocator) !ListPromptsResult` | `.prompts = .{}` |
 | `getPrompt` | `fn(*Handler, Allocator, GetPromptParams) !GetPromptResult` | `.prompts = .{}` |
+| `setLoggingLevel` | `fn(*Handler, LoggingLevel) void` | `.logging = .{}` |
 
-The `Allocator` passed to each handler is an **arena scoped to the request**. Allocate freely from it. Memory is released automatically when the response is sent.
+The `Allocator` passed to each handler is an arena scoped to the request. Allocate freely from it; memory is released after the response is sent.
 
-If a `callTool` handler returns an error, it is sent to the client as a tool result with `isError: true`, not as a JSON-RPC error. This matches the MCP spec.
+If `callTool` returns an error, the client receives a tool result with `isError: true` rather than a JSON-RPC error, as the MCP spec requires.
+
+### Schema generation
+
+`schemaForStruct` reflects on a struct at compile time and emits a JSON Schema string. `parseArgs` parses incoming arguments into the same struct, so the schema and the parser cannot drift apart. Supported field types: strings, bools, integers, floats, enums, slices, nested structs, and optionals of any of these. Struct defaults become schema defaults and make fields optional. A `pub const descriptions` declaration adds per-field descriptions.
 
 ## Server Options
 
 ```zig
 mcp.Server(Handler).init(allocator, &handler, .{
-    // Required
     .server_info = .{ .name = "my-server", .version = "1.0.0" },
 
-    // Declare what the server supports (default: nothing)
+    // What the server supports (default: nothing)
     .capabilities = .{
-        .tools = .{},           // enable tools/list and tools/call
-        .resources = .{},       // enable resources/list and resources/read
-        .prompts = .{},         // enable prompts/list and prompts/get
+        .tools = .{},
+        .resources = .{},
+        .prompts = .{},
+        .logging = .{},
     },
 
     // Optional instructions shown to the client
@@ -146,25 +172,23 @@ mcp.Server(Handler).init(allocator, &handler, .{
 
 ```zig
 mcp.HttpTransport(Handler).init(allocator, &server, .{
-    .port = 8080,              // default
-    .address = "127.0.0.1",   // default, use "0.0.0.0" for all interfaces
+    .port = 8080,                 // default
+    .address = "127.0.0.1",       // default, use "0.0.0.0" for all interfaces
+    .max_body_size = 1024 * 1024, // reject larger POST bodies with 413
+    .allowed_origins = &.{},      // extra origins beyond localhost
 });
 ```
 
 The HTTP transport implements the [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) protocol:
 
-- `POST /`: JSON-RPC messages (requests and notifications)
-- `DELETE /`: terminate session
-- Session management via `Mcp-Session-Id` headers
-- `Accept: application/json` validation
-
-Currently requires Linux (uses `getrandom` syscall for session IDs).
+- `POST /` for JSON-RPC messages, `DELETE /` to terminate the session
+- Session management via `Mcp-Session-Id` headers, IDs from the OS CSPRNG
+- `Content-Type` and `Accept` validation
+- Origin header validation against localhost plus `allowed_origins`, which blocks DNS rebinding attacks. Non-browser clients that send no Origin header always pass.
 
 ## Connecting to Clients
 
-### Claude Desktop / Cursor (stdio)
-
-Add to your MCP configuration:
+### Claude Desktop / Claude Code / Cursor (stdio)
 
 ```json
 {
@@ -220,16 +244,24 @@ curl -X POST http://localhost:8080 \
 ```bash
 zig build              # compile example servers
 zig build test         # run all tests
-zig build check        # run tests, format checks, and compile examples
+zig build check        # tests + format checks + compile examples
+zig build examples     # install example binaries to zig-out/bin
 zig build example      # build and run the stdio greeter example
 zig build example-http # build and run the HTTP greeter example
 ```
+
+CI runs `zig build check` plus an MCP conformance script ([`scripts/conformance.sh`](scripts/conformance.sh)) that drives the greeter binary through a full stdio session: handshake, ping, tool calls, resources, prompts, error codes, and parse-error recovery.
+
+## Versioning
+
+- Tracks the latest stable Zig release, currently 0.16.0. New stable Zig releases are adopted within a few weeks.
+- Semantic versioning, see [CHANGELOG.md](CHANGELOG.md). Until 1.0.0, minor versions may contain breaking changes.
 
 ## Examples
 
 - [`examples/greeter.zig`](examples/greeter.zig): stdio server with tools, resources, and prompts
 - [`examples/greeter_http.zig`](examples/greeter_http.zig): HTTP server with tools
-- [`examples/channel.zig`](examples/channel.zig): channel protocol example
+- [`examples/channel.zig`](examples/channel.zig): Claude channel protocol example
 
 ## License
 

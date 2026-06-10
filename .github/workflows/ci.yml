@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Tests, format check, compile examples
+        run: zig build check
+
+      - name: Install example binaries
+        run: zig build examples
+
+      - name: MCP conformance check
+        run: ./scripts/conformance.sh

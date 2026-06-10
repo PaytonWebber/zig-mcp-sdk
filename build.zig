@@ -24,6 +24,11 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, "example-http", "Build and run the HTTP greeter example", greeter_http);
     addRunStep(b, "example-channel", "Build and run the channel example", channel);
 
+    const examples_step = b.step("examples", "Install example binaries to zig-out/bin");
+    examples_step.dependOn(&b.addInstallArtifact(greeter, .{}).step);
+    examples_step.dependOn(&b.addInstallArtifact(greeter_http, .{}).step);
+    examples_step.dependOn(&b.addInstallArtifact(channel, .{}).step);
+
     const mod_tests = b.addTest(.{ .root_module = mcp_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
