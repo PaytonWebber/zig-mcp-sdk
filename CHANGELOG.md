@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Until 1.0.0, minor versions may contain breaking changes.
 
+## [0.3.0] - 2026-06-10
+
+### Added
+
+- POST response streaming: `callTool` may take a per-call `Context`
+  (`fn(*Handler, Allocator, Context, CallToolParams)`, arity detected at
+  comptime). Over HTTP, notifications sent during the call stream on the
+  POST's own SSE response (progress events, then the result) when the client
+  accepts `text/event-stream`. Over stdio they interleave on stdout.
+- SSE resumability: events carry monotonically increasing ids, undelivered
+  notifications are buffered per session (`sse_replay_events` option) and
+  replayed when a stream opens, and `Last-Event-ID` resumes after reconnect.
+- Session idle timeout: a background reaper terminates sessions inactive for
+  `session_idle_seconds` (default 600, 0 disables).
+- `Server.handleRequestWithContext` for transports that route notifications
+  per request.
+
+### Changed
+
+- **Breaking (behavior):** a second GET stream on a session now takes over
+  (last connection wins) instead of receiving 409. A dead client is
+  indistinguishable from a quiet one between keepalives, so 409 locked out
+  reconnecting clients for up to a keepalive interval.
+- Notifications sent with no stream open are now buffered for later delivery
+  instead of failing with `NoEventStream` (unless `sse_replay_events = 0`).
+
 ## [0.2.0] - 2026-06-10
 
 ### Added
@@ -65,5 +91,6 @@ First tagged release.
 - Examples: greeter (stdio), greeter (HTTP), channel server.
 - MCP stdio conformance script (`scripts/conformance.sh`) run in CI.
 
+[0.3.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.3.0
 [0.2.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.1.0

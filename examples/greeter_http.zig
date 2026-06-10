@@ -35,7 +35,10 @@ const Handler = struct {
         };
     }
 
-    pub fn callTool(_: *Handler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
+    // The 4-arg form receives a per-call Context: notifications sent during
+    // the call stream back on the POST's SSE response (when the client
+    // accepts text/event-stream). Valid only for the duration of the call.
+    pub fn callTool(_: *Handler, allocator: Allocator, ctx: mcp.Context, params: types.CallToolParams) !types.CallToolResult {
         if (std.mem.eql(u8, params.name, "greet")) {
             const args = try types.parseArgs(GreetArgs, allocator, params.arguments);
             const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}! Welcome to the Zig MCP SDK.", .{args.name});
@@ -53,6 +56,13 @@ const Handler = struct {
                 item.* = types.Content.text_content(
                     try std.fmt.allocPrint(allocator, "Greeting {d}: Hello, {s}!", .{ i, args.name }),
                 );
+                if (params.progressToken()) |token| {
+                    ctx.sendProgress(.{
+                        .progressToken = token,
+                        .progress = @floatFromInt(i),
+                        .total = @floatFromInt(args.count),
+                    }) catch {};
+                }
             }
             return .{ .content = content };
         }

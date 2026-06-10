@@ -76,23 +76,28 @@ expect_contains "session B negotiates its requested version" '"protocolVersion":
     && echo "ok: sessions get distinct ids" \
     || { echo "FAIL: sessions get distinct ids" >&2; failures=$((failures + 1)); }
 
-# --- SSE stream opened before initialized; onReady notification arrives on it
-timeout 6 curl -s -N -H "Accept: text/event-stream" -H "Mcp-Session-Id: $SID_A" "$BASE" >"$tmpdir/sse.txt" &
-SSE_PID=$!
-sleep 1
-
+# --- initialized with no stream open: the onReady notification is buffered
 code="$(curl -s -o /dev/null -w '%{http_code}' "${JSON[@]}" -H "Mcp-Session-Id: $SID_A" \
     -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$BASE")"
 expect_eq "initialized notification gets 202" 202 "$code"
 
-# Second GET while the stream is open conflicts
-code="$(curl -s -o /dev/null -w '%{http_code}' -H "Accept: text/event-stream" -H "Mcp-Session-Id: $SID_A" "$BASE")"
-expect_eq "second SSE stream gets 409" 409 "$code"
+# --- Opening the stream replays the buffered event with an id
+timeout 4 curl -s -N -H "Accept: text/event-stream" -H "Mcp-Session-Id: $SID_A" "$BASE" >"$tmpdir/sse.txt" &
+SSE_PID=$!
+sleep 1
 
-# --- Tool call on the ready session
+# --- Plain JSON tool call (no Accept: text/event-stream)
 CALL="$(curl -s "${JSON[@]}" -H "Mcp-Session-Id: $SID_A" \
     -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"greet","arguments":{"name":"HTTP"}},"id":2}' "$BASE")"
 expect_contains "tools/call returns the greeting" 'Hello, HTTP! Welcome to the Zig MCP SDK.' "$CALL"
+
+# --- Streamed tool call: progress events then the result on the POST stream
+STREAMED="$(curl -s -N -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -H "Mcp-Session-Id: $SID_A" \
+    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"multi_greet","arguments":{"name":"Zig","count":3},"_meta":{"progressToken":"pt-1"}},"id":3}' "$BASE")"
+progress_count="$(grep -c '"method":"notifications/progress"' <<<"$STREAMED" || true)"
+expect_eq "streamed tools/call carries 3 progress events" 3 "$progress_count"
+expect_contains "streamed tools/call ends with the result" 'Greeting 3: Hello, Zig!' "$STREAMED"
+expect_contains "progress events echo the progress token" '"progressToken":"pt-1"' "$STREAMED"
 
 # --- Security rejections
 code="$(curl -s -o /dev/null -w '%{http_code}' "${JSON[@]}" -H "Origin: http://evil.example" -H "Mcp-Session-Id: $SID_A" \
@@ -111,8 +116,15 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE")"
 expect_eq "unsupported method gets 405" 405 "$code"
 
 wait "$SSE_PID" 2>/dev/null || true
-expect_contains "onReady log message arrives as an SSE event" \
+expect_contains "buffered onReady log message is replayed when the stream opens" \
     'data: {"jsonrpc":"2.0","method":"notifications/message"' "$(cat "$tmpdir/sse.txt")"
+expect_contains "replayed events carry SSE ids" 'id: 1' "$(cat "$tmpdir/sse.txt")"
+
+# --- Reconnect with Last-Event-ID: takes over the slot (last connection
+# wins) and resumes from the given id
+RESUMED="$(timeout 3 curl -s -N -H "Accept: text/event-stream" -H "Mcp-Session-Id: $SID_A" -H "Last-Event-ID: 0" "$BASE" || true)"
+expect_contains "reconnect with Last-Event-ID replays earlier events" '"method":"notifications/message"' "$RESUMED"
+expect_contains "replayed events keep their original ids" 'id: 1' "$RESUMED"
 
 # --- DELETE terminates the session
 code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -H "Mcp-Session-Id: $SID_A" "$BASE")"

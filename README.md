@@ -140,7 +140,7 @@ Implement only what your server supports and declare the matching capabilities.
 | `setLoggingLevel` | `fn(*Handler, LoggingLevel) void` | `.logging = .{}` |
 | `onCancelled` | `fn(*Handler, CancelledParams) void` | none |
 
-List handlers may instead take `(*Handler, Allocator, ListParams)` to receive the pagination cursor; the arity is detected at compile time. Return `nextCursor` in the result to signal more pages.
+List handlers may instead take `(*Handler, Allocator, ListParams)` to receive the pagination cursor, and `callTool` may instead take `(*Handler, Allocator, Context, CallToolParams)` to send notifications during the call; the arity is detected at compile time. Return `nextCursor` in list results to signal more pages.
 
 The `Allocator` passed to each handler is an arena scoped to the request. Allocate freely from it; memory is released after the response is sent. Slices in params are request-scoped too: copy them if you keep them past the handler call.
 
@@ -156,7 +156,18 @@ ctx.sendProgress(.{ .progressToken = token, .progress = 0.5, .total = 1.0 });
 ctx.sendNotification("notifications/tools/list_changed", .{});
 ```
 
-For progress, echo the token from `CallToolParams.progressToken()` (sent by the client in `_meta.progressToken`). Over stdio, notifications interleave with responses on stdout. Over HTTP, they are delivered as server-sent events on the session's GET stream.
+For progress during a tool call, use the 4-arg `callTool` form and echo the token from `CallToolParams.progressToken()` (sent by the client in `_meta.progressToken`):
+
+```zig
+pub fn callTool(_: *H, allocator: Allocator, ctx: mcp.Context, params: types.CallToolParams) !types.CallToolResult {
+    if (params.progressToken()) |token| {
+        try ctx.sendProgress(.{ .progressToken = token, .progress = 1.0, .total = 10.0 });
+    }
+    // ...
+}
+```
+
+Over stdio, notifications interleave with responses on stdout. Over HTTP, notifications sent during a tool call stream on the POST's own SSE response (when the client accepts `text/event-stream`); session-level notifications are delivered on the session's GET stream.
 
 ### Schema generation
 
@@ -195,6 +206,8 @@ mcp.HttpTransport(Handler).init(allocator, &server, .{
     .allowed_origins = &.{},      // extra origins beyond localhost
     .max_sessions = 64,           // new initialize beyond this gets 503
     .sse_keepalive_seconds = 15,  // keepalive interval on SSE streams
+    .sse_replay_events = 64,      // buffered events for replay/resume, 0 disables
+    .session_idle_seconds = 600,  // reap inactive sessions, 0 disables
 });
 ```
 
@@ -203,7 +216,9 @@ The HTTP transport implements the [MCP Streamable HTTP](https://modelcontextprot
 - `POST /` for JSON-RPC messages, `GET /` with `Accept: text/event-stream` for the server-to-client event stream, `DELETE /` to terminate the session
 - Multiple concurrent sessions, each negotiating its own protocol version, with connections handled in parallel
 - Session management via `Mcp-Session-Id` headers, IDs from the OS CSPRNG
-- Server-initiated notifications (logging, progress, channel events) delivered as SSE events on the session's GET stream, with periodic keepalives
+- Tool calls stream their response as SSE when the client accepts it: progress notifications first, then the result
+- Resumable event streams: events carry ids, undelivered events are buffered and replayed when a stream opens, and `Last-Event-ID` resumes after a reconnect. A new GET takes over the stream (last connection wins).
+- Idle sessions are reaped by a background task after `session_idle_seconds` of inactivity
 - `Content-Type` and `Accept` validation
 - Origin header validation against localhost plus `allowed_origins`, which blocks DNS rebinding attacks. Non-browser clients that send no Origin header always pass.
 

@@ -25,6 +25,74 @@ pub const HttpOptions = struct {
     max_sessions: usize = 64,
     /// Seconds between SSE keepalive comments on an open GET stream.
     sse_keepalive_seconds: i64 = 15,
+    /// Recent notifications retained per session for SSE delivery: events
+    /// sent with no stream open are buffered and replayed when one opens,
+    /// and reconnecting clients resume via the `Last-Event-ID` header.
+    /// 0 disables buffering and replay.
+    sse_replay_events: usize = 64,
+    /// Sessions inactive for this many seconds are terminated by a background
+    /// reaper. Must exceed `sse_keepalive_seconds` (an open event stream
+    /// counts as activity on every keepalive). 0 disables the reaper.
+    session_idle_seconds: i64 = 600,
+};
+
+/// Ring buffer of recent SSE events with monotonically increasing ids.
+/// Powers delivery buffering (events sent with no stream open are replayed
+/// when one opens) and `Last-Event-ID` resumability.
+pub const EventLog = struct {
+    /// Slot for id N is (N-1) % capacity; older entries are evicted as new
+    /// ones arrive.
+    entries: []?Entry = &.{},
+    next_id: u64 = 1,
+    /// Highest id written to a live stream; entries above it are undelivered.
+    delivered_up_to: u64 = 0,
+
+    pub const Entry = struct {
+        id: u64,
+        data: []u8,
+    };
+
+    pub fn initCapacity(allocator: Allocator, capacity: usize) !EventLog {
+        const entries = try allocator.alloc(?Entry, capacity);
+        @memset(entries, null);
+        return .{ .entries = entries };
+    }
+
+    pub fn deinit(log: *EventLog, allocator: Allocator) void {
+        for (log.entries) |slot| {
+            if (slot) |entry| allocator.free(entry.data);
+        }
+        allocator.free(log.entries);
+        log.* = .{};
+    }
+
+    /// Buffer one event and return its id. With zero capacity nothing is
+    /// stored but ids still advance.
+    pub fn append(log: *EventLog, allocator: Allocator, data: []const u8) !u64 {
+        const id = log.next_id;
+        log.next_id += 1;
+        if (log.entries.len > 0) {
+            const slot = &log.entries[@intCast((id - 1) % log.entries.len)];
+            if (slot.*) |old| allocator.free(old.data);
+            slot.* = null;
+            slot.* = .{ .id = id, .data = try allocator.dupe(u8, data) };
+        }
+        return id;
+    }
+
+    /// The retained entry with the lowest id greater than `after`, or null.
+    /// Iterate replay as: `while (log.nextAfter(cursor)) |e| { ...; cursor = e.id; }`
+    pub fn nextAfter(log: *const EventLog, after: u64) ?Entry {
+        if (log.entries.len == 0) return null;
+        const newest = log.next_id - 1;
+        if (newest == 0 or after >= newest) return null;
+        const oldest_retained = if (newest > log.entries.len)
+            newest - log.entries.len + 1
+        else
+            1;
+        const id = @max(after + 1, oldest_retained);
+        return log.entries[@intCast((id - 1) % log.entries.len)];
+    }
 };
 
 /// Streamable HTTP transport for an MCP server.
@@ -53,15 +121,22 @@ pub fn HttpTransport(comptime Handler: type) type {
 
         pub const Session = struct {
             id: [32]u8,
-            /// The transport's Io handle, needed by sseSend (which receives
-            /// only the type-erased session pointer) to lock the SSE slot.
+            /// The transport's Io handle and allocator, needed by sseSend
+            /// (which receives only the type-erased session pointer) to lock
+            /// the SSE slot and buffer events.
             io: Io,
+            allocator: Allocator,
             state: std.atomic.Value(State),
             /// One reference is held by the session map; each request handler
             /// working with the session holds another for its duration.
             refs: std.atomic.Value(u32),
             terminated: std.atomic.Value(bool),
+            /// Monotonic seconds (`.awake` clock) of the last request or
+            /// keepalive on this session; read by the idle reaper.
+            last_activity: std.atomic.Value(i64),
             sse: SseSlot = .{},
+            /// Guarded by `sse.mutex`.
+            events: EventLog = .{},
 
             pub const State = enum(u8) {
                 awaiting_initialized,
@@ -71,9 +146,13 @@ pub fn HttpTransport(comptime Handler: type) type {
 
         const SseSlot = struct {
             mutex: Io.Mutex = .init,
-            /// Claimed before the response head is sent, so a second GET can
-            /// be rejected with 409 even before `body` is registered.
-            claimed: bool = false,
+            /// Generation of the GET task that owns the stream; 0 = none.
+            /// A new GET always takes over (last connection wins): a dead
+            /// client is indistinguishable from a quiet one between
+            /// keepalives, so refusing a second stream would lock out
+            /// reconnecting clients for up to a keepalive interval.
+            owner: u64 = 0,
+            next_gen: u64 = 0,
             body: ?*http.BodyWriter = null,
         };
 
@@ -88,6 +167,7 @@ pub fn HttpTransport(comptime Handler: type) type {
             content_type_json: bool,
             session_id: ?[]const u8,
             origin: ?[]const u8,
+            last_event_id: ?[]const u8,
         };
 
         pub fn init(allocator: Allocator, server: *ServerType, options: HttpOptions) Self {
@@ -102,7 +182,10 @@ pub fn HttpTransport(comptime Handler: type) type {
         /// no connection tasks are running.
         pub fn deinit(self: *Self) void {
             var it = self.sessions.map.valueIterator();
-            while (it.next()) |session| self.allocator.destroy(session.*);
+            while (it.next()) |session| {
+                session.*.events.deinit(self.allocator);
+                self.allocator.destroy(session.*);
+            }
             self.sessions.map.deinit(self.allocator);
         }
 
@@ -111,6 +194,10 @@ pub fn HttpTransport(comptime Handler: type) type {
             var net_server = try address.listen(io, .{ .reuse_address = true });
             defer net_server.deinit(io);
             defer self.group.cancel(io);
+
+            if (self.options.session_idle_seconds > 0) {
+                self.group.concurrent(io, reaperTask, .{ self, io }) catch {};
+            }
 
             while (true) {
                 const stream = try net_server.accept(io);
@@ -247,7 +334,7 @@ pub fn HttpTransport(comptime Handler: type) type {
 
                 switch (session.state.load(.acquire)) {
                     .awaiting_initialized => try self.handleAwaitingInitialized(message, request, session),
-                    .ready => try self.handleReady(message, request, session),
+                    .ready => try self.handleReady(message, request, session, headers.accept_sse),
                 }
             } else {
                 try self.handlePreSession(message, request, io);
@@ -351,22 +438,28 @@ pub fn HttpTransport(comptime Handler: type) type {
             }
         }
 
-        fn handleReady(self: *Self, msg: json_rpc.Message, request: *http.Server.Request, session: *Session) !void {
+        fn handleReady(self: *Self, msg: json_rpc.Message, request: *http.Server.Request, session: *Session, accept_sse: bool) !void {
             switch (msg) {
                 .request => |req| {
+                    // tools/call with a context-taking handler streams the
+                    // POST response as SSE (progress events, then the result)
+                    // when the client accepts text/event-stream.
+                    const takes_ctx = comptime @hasDecl(Handler, "callTool") and
+                        @typeInfo(@TypeOf(Handler.callTool)).@"fn".params.len == 4;
+                    if (takes_ctx and accept_sse and mem.eql(u8, req.method, "tools/call")) {
+                        return self.handleStreamedToolCall(req, request, session);
+                    }
+
                     var response_buf: [256 * 1024]u8 = undefined;
                     var writer = Io.Writer.fixed(&response_buf);
 
-                    self.server.handleRequest(req, &writer) catch {
+                    self.server.handleRequestWithContext(req, &writer, self.sessionContext(session)) catch {
                         // Don't leak internal Zig error names to the client.
                         json_rpc.sendError(req.id, .internal_error, null, &writer) catch {};
                     };
 
                     const written = response_buf[0..writer.end];
-                    const body = if (written.len > 0 and written[written.len - 1] == '\n')
-                        written[0 .. written.len - 1]
-                    else
-                        written;
+                    const body = mem.trimEnd(u8, written, "\n");
 
                     return request.respond(body, .{
                         .extra_headers = &.{
@@ -386,6 +479,52 @@ pub fn HttpTransport(comptime Handler: type) type {
                     return request.respond("", .{ .status = .bad_request });
                 },
             }
+        }
+
+        /// Stream a tools/call response as SSE on the POST connection:
+        /// notifications the handler sends during the call become events,
+        /// followed by the JSON-RPC response as the final event.
+        fn handleStreamedToolCall(self: *Self, req: json_rpc.Request, request: *http.Server.Request, session: *Session) !void {
+            var response_buf: [256 * 1024]u8 = undefined;
+            var writer = Io.Writer.fixed(&response_buf);
+
+            var stream_buf: [16 * 1024]u8 = undefined;
+            var body_writer = try request.respondStreaming(&stream_buf, .{
+                .respond_options = .{
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "text/event-stream" },
+                        .{ .name = "cache-control", .value = "no-cache" },
+                        .{ .name = "mcp-session-id", .value = &session.id },
+                    },
+                },
+            });
+
+            // The handler runs synchronously on this task, so the stream
+            // needs no lock; the context must not outlive the call.
+            var post_stream = PostStream{ .body = &body_writer };
+            const ctx = server_mod.Context{ .sink = .{ .custom = .{
+                .ptr = &post_stream,
+                .allocator = self.allocator,
+                .send = postStreamSend,
+            } } };
+
+            self.server.handleRequestWithContext(req, &writer, ctx) catch {
+                // Don't leak internal Zig error names to the client.
+                json_rpc.sendError(req.id, .internal_error, null, &writer) catch {};
+            };
+
+            const body = mem.trimEnd(u8, response_buf[0..writer.end], "\n");
+            writeEvent(&body_writer, body, null) catch {};
+            body_writer.end() catch {};
+        }
+
+        const PostStream = struct {
+            body: *http.BodyWriter,
+        };
+
+        fn postStreamSend(ptr: *anyopaque, message: []const u8) anyerror!void {
+            const stream: *PostStream = @ptrCast(@alignCast(ptr));
+            try writeEvent(stream.body, mem.trimEnd(u8, message, "\n"), null);
         }
 
         // =================================================================
@@ -414,18 +553,22 @@ pub fn HttpTransport(comptime Handler: type) type {
             };
             defer self.releaseSession(session);
 
-            {
+            const my_gen = blk: {
                 session.sse.mutex.lockUncancelable(io);
                 defer session.sse.mutex.unlock(io);
-                if (session.sse.claimed) {
-                    return request.respond("", .{ .status = .conflict });
-                }
-                session.sse.claimed = true;
-            }
+                session.sse.next_gen += 1;
+                session.sse.owner = session.sse.next_gen;
+                // Abandon any previous stream; its GET task notices the owner
+                // change at its next keepalive tick and exits.
+                session.sse.body = null;
+                break :blk session.sse.next_gen;
+            };
             defer {
                 session.sse.mutex.lockUncancelable(io);
-                session.sse.body = null;
-                session.sse.claimed = false;
+                if (session.sse.owner == my_gen) {
+                    session.sse.owner = 0;
+                    session.sse.body = null;
+                }
                 session.sse.mutex.unlock(io);
             }
 
@@ -444,49 +587,72 @@ pub fn HttpTransport(comptime Handler: type) type {
             {
                 session.sse.mutex.lockUncancelable(io);
                 defer session.sse.mutex.unlock(io);
-                session.sse.body = &body_writer;
+
+                if (session.sse.owner == my_gen) {
+                    // Replay before going live: from Last-Event-ID if the
+                    // client is resuming, otherwise everything undelivered.
+                    var cursor: u64 = parseLastEventId(headers.last_event_id) orelse
+                        session.events.delivered_up_to;
+                    while (session.events.nextAfter(cursor)) |entry| {
+                        try writeEvent(&body_writer, entry.data, entry.id);
+                        cursor = entry.id;
+                        if (entry.id > session.events.delivered_up_to) {
+                            session.events.delivered_up_to = entry.id;
+                        }
+                    }
+
+                    session.sse.body = &body_writer;
+                }
             }
 
             // Keep the stream open: notifications are written by sseSend from
             // other tasks; this task sends keepalive comments and watches for
-            // termination or a dead stream.
+            // termination, takeover by a newer stream, or a dead connection.
             while (true) {
                 try io.sleep(.fromSeconds(self.options.sse_keepalive_seconds), .awake);
                 if (session.terminated.load(.acquire)) break;
+                touch(session, io);
 
                 session.sse.mutex.lockUncancelable(io);
                 defer session.sse.mutex.unlock(io);
+                if (session.sse.owner != my_gen) break; // newer stream took over
                 if (session.sse.body == null) break; // stream died in sseSend
                 body_writer.writer.writeAll(": keepalive\n\n") catch break;
                 body_writer.writer.flush() catch break;
                 body_writer.flush() catch break;
             }
 
-            {
-                session.sse.mutex.lockUncancelable(io);
-                defer session.sse.mutex.unlock(io);
-                session.sse.body = null;
-            }
             body_writer.end() catch {};
         }
 
-        /// `Context.Sink.custom` callback: deliver one serialized JSON-RPC
-        /// notification as an SSE event on the session's open GET stream.
+        /// `Context.Sink.custom` callback for the session's GET stream.
+        /// The event is buffered in the session's event log, then delivered
+        /// immediately when a stream is open. Buffered events are replayed
+        /// when a stream (re)opens, so a closed stream is only an error when
+        /// buffering is disabled.
         fn sseSend(ptr: *anyopaque, message: []const u8) anyerror!void {
             const session: *Session = @ptrCast(@alignCast(ptr));
             session.sse.mutex.lockUncancelable(session.io);
             defer session.sse.mutex.unlock(session.io);
 
-            const body = session.sse.body orelse return error.NoEventStream;
             const line = mem.trimEnd(u8, message, "\n");
-            writeEvent(body, line) catch |err| {
-                // Mark the stream dead so the GET task stops using it.
-                session.sse.body = null;
-                return err;
+            const id = try session.events.append(session.allocator, line);
+
+            const body = session.sse.body orelse {
+                if (session.events.entries.len == 0) return error.NoEventStream;
+                return; // buffered; delivered when a stream opens
             };
+            writeEvent(body, line, id) catch {
+                // Mark the stream dead so the GET task stops using it; the
+                // event stays buffered for replay on reconnect.
+                session.sse.body = null;
+                return;
+            };
+            session.events.delivered_up_to = id;
         }
 
-        fn writeEvent(body: *http.BodyWriter, line: []const u8) !void {
+        fn writeEvent(body: *http.BodyWriter, line: []const u8, id: ?u64) !void {
+            if (id) |i| try body.writer.print("id: {d}\n", .{i});
             try body.writer.writeAll("data: ");
             try body.writer.writeAll(line);
             try body.writer.writeAll("\n\n");
@@ -546,11 +712,15 @@ pub fn HttpTransport(comptime Handler: type) type {
             session.* = .{
                 .id = id,
                 .io = io,
+                .allocator = self.allocator,
                 .state = .init(.awaiting_initialized),
                 // One reference for the map, one for the creating request.
                 .refs = .init(2),
                 .terminated = .init(false),
+                .last_activity = .init(Io.Timestamp.now(io, .awake).toSeconds()),
+                .events = try EventLog.initCapacity(self.allocator, self.options.sse_replay_events),
             };
+            errdefer session.events.deinit(self.allocator);
 
             self.sessions.mutex.lockUncancelable(io);
             defer self.sessions.mutex.unlock(io);
@@ -570,12 +740,54 @@ pub fn HttpTransport(comptime Handler: type) type {
             defer self.sessions.mutex.unlock(io);
             const session = self.sessions.map.get(key) orelse return null;
             _ = session.refs.fetchAdd(1, .monotonic);
+            touch(session, io);
             return session;
         }
 
         fn releaseSession(self: *Self, session: *Session) void {
             if (session.refs.fetchSub(1, .acq_rel) == 1) {
+                session.events.deinit(self.allocator);
                 self.allocator.destroy(session);
+            }
+        }
+
+        /// Background task: terminate sessions with no activity for
+        /// `session_idle_seconds`. Spawned by `listen` when enabled.
+        fn reaperTask(self: *Self, io: Io) Io.Cancelable!void {
+            const idle = self.options.session_idle_seconds;
+            const interval = @max(@divTrunc(idle, 4), 1);
+            while (true) {
+                try io.sleep(.fromSeconds(interval), .awake);
+                self.reapIdleSessions(io) catch {};
+            }
+        }
+
+        fn reapIdleSessions(self: *Self, io: Io) !void {
+            const now = Io.Timestamp.now(io, .awake).toSeconds();
+            const idle = self.options.session_idle_seconds;
+
+            var expired: std.ArrayList(*Session) = .empty;
+            defer expired.deinit(self.allocator);
+
+            {
+                self.sessions.mutex.lockUncancelable(io);
+                defer self.sessions.mutex.unlock(io);
+
+                var it = self.sessions.map.valueIterator();
+                while (it.next()) |entry| {
+                    const session = entry.*;
+                    if (now - session.last_activity.load(.monotonic) > idle) {
+                        try expired.append(self.allocator, session);
+                    }
+                }
+                for (expired.items) |session| {
+                    _ = self.sessions.map.remove(session.id);
+                }
+            }
+
+            for (expired.items) |session| {
+                session.terminated.store(true, .release);
+                self.releaseSession(session); // drop the map's reference
             }
         }
 
@@ -614,6 +826,7 @@ pub fn HttpTransport(comptime Handler: type) type {
                 .content_type_json = false,
                 .session_id = null,
                 .origin = null,
+                .last_event_id = null,
             };
             var it = request.iterateHeaders();
             while (it.next()) |header| {
@@ -636,6 +849,8 @@ pub fn HttpTransport(comptime Handler: type) type {
                     result.session_id = header.value;
                 } else if (std.ascii.eqlIgnoreCase(header.name, "origin")) {
                     result.origin = header.value;
+                } else if (std.ascii.eqlIgnoreCase(header.name, "last-event-id")) {
+                    result.last_event_id = header.value;
                 }
             }
             return result;
@@ -665,6 +880,16 @@ pub fn HttpTransport(comptime Handler: type) type {
             return std.ascii.eqlIgnoreCase(host, "localhost") or
                 mem.eql(u8, host, "127.0.0.1") or
                 mem.eql(u8, host, "[::1]");
+        }
+
+        fn parseLastEventId(header: ?[]const u8) ?u64 {
+            const value = header orelse return null;
+            return std.fmt.parseInt(u64, value, 10) catch null;
+        }
+
+        fn touch(session: *Session, io: Io) void {
+            const now = Io.Timestamp.now(io, .awake).toSeconds();
+            session.last_activity.store(now, .monotonic);
         }
 
         fn generateSessionId(io: Io) ![32]u8 {
@@ -727,9 +952,12 @@ test "session refcounting: DELETE-while-acquired defers destruction" {
     session.* = .{
         .id = "0123456789abcdef0123456789abcdef".*,
         .io = testing.io,
+        .allocator = testing.allocator,
         .state = .init(.ready),
         .refs = .init(1),
         .terminated = .init(false),
+        .last_activity = .init(0),
+        .events = try EventLog.initCapacity(testing.allocator, 4),
     };
     try transport.sessions.map.put(testing.allocator, session.id, session);
 
@@ -760,6 +988,94 @@ test "acquireSession rejects unknown and malformed ids" {
     try testing.expect(transport.acquireSession("0123456789abcdef0123456789abcdef", testing.io) == null);
 }
 
+test "EventLog: append assigns sequential ids and evicts oldest at capacity" {
+    var log = try EventLog.initCapacity(testing.allocator, 3);
+    defer log.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(u64, 1), try log.append(testing.allocator, "one"));
+    try testing.expectEqual(@as(u64, 2), try log.append(testing.allocator, "two"));
+    try testing.expectEqual(@as(u64, 3), try log.append(testing.allocator, "three"));
+    try testing.expectEqual(@as(u64, 4), try log.append(testing.allocator, "four")); // evicts "one"
+
+    // Replay from 0: oldest retained is id 2.
+    var cursor: u64 = 0;
+    var seen: usize = 0;
+    var first_id: u64 = 0;
+    while (log.nextAfter(cursor)) |entry| {
+        if (seen == 0) first_id = entry.id;
+        cursor = entry.id;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(u64, 2), first_id);
+    try testing.expectEqual(@as(usize, 3), seen);
+}
+
+test "EventLog: nextAfter resumes from a given id" {
+    var log = try EventLog.initCapacity(testing.allocator, 8);
+    defer log.deinit(testing.allocator);
+
+    _ = try log.append(testing.allocator, "a");
+    _ = try log.append(testing.allocator, "b");
+    _ = try log.append(testing.allocator, "c");
+
+    const entry = log.nextAfter(2) orelse return error.MissingEntry;
+    try testing.expectEqual(@as(u64, 3), entry.id);
+    try testing.expectEqualStrings("c", entry.data);
+
+    try testing.expect(log.nextAfter(3) == null);
+    try testing.expect(log.nextAfter(99) == null);
+}
+
+test "EventLog: zero capacity advances ids but stores nothing" {
+    var log = EventLog{};
+    try testing.expectEqual(@as(u64, 1), try log.append(testing.allocator, "x"));
+    try testing.expectEqual(@as(u64, 2), try log.append(testing.allocator, "y"));
+    try testing.expect(log.nextAfter(0) == null);
+}
+
+test "reapIdleSessions terminates expired sessions and keeps active ones" {
+    var handler = NoopHandler{};
+    var server = server_mod.Server(NoopHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "t", .version = "0" },
+    });
+    var transport = TestTransport.init(testing.allocator, &server, .{ .session_idle_seconds = 60 });
+    defer transport.deinit();
+
+    const now = Io.Timestamp.now(testing.io, .awake).toSeconds();
+
+    const stale = try testing.allocator.create(TestTransport.Session);
+    stale.* = .{
+        .id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".*,
+        .io = testing.io,
+        .allocator = testing.allocator,
+        .state = .init(.ready),
+        .refs = .init(1),
+        .terminated = .init(false),
+        .last_activity = .init(now - 120),
+        .events = .{},
+    };
+    try transport.sessions.map.put(testing.allocator, stale.id, stale);
+
+    const fresh = try testing.allocator.create(TestTransport.Session);
+    fresh.* = .{
+        .id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".*,
+        .io = testing.io,
+        .allocator = testing.allocator,
+        .state = .init(.ready),
+        .refs = .init(1),
+        .terminated = .init(false),
+        .last_activity = .init(now),
+        .events = .{},
+    };
+    try transport.sessions.map.put(testing.allocator, fresh.id, fresh);
+
+    try transport.reapIdleSessions(testing.io);
+
+    try testing.expectEqual(@as(u32, 1), @as(u32, @intCast(transport.sessions.map.count())));
+    try testing.expect(transport.sessions.map.get(fresh.id) != null);
+    try testing.expect(transport.sessions.map.get(stale.id) == null);
+}
+
 test "max_sessions caps live sessions" {
     var handler = NoopHandler{};
     var server = server_mod.Server(NoopHandler).init(testing.allocator, &handler, .{
@@ -772,9 +1088,12 @@ test "max_sessions caps live sessions" {
     first.* = .{
         .id = "0123456789abcdef0123456789abcdef".*,
         .io = testing.io,
+        .allocator = testing.allocator,
         .state = .init(.ready),
         .refs = .init(1),
         .terminated = .init(false),
+        .last_activity = .init(0),
+        .events = .{},
     };
     try transport.sessions.map.put(testing.allocator, first.id, first);
 

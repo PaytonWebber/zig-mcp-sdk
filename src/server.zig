@@ -88,7 +88,10 @@ pub const Options = struct {
 ///   fn onCancelled(*Handler, types.CancelledParams) void
 ///
 /// List methods may instead take `(*Handler, Allocator, types.ListParams)` to
-/// receive the pagination cursor; the arity is detected at comptime.
+/// receive the pagination cursor, and `callTool` may instead take
+/// `(*Handler, Allocator, Context, types.CallToolParams)` to send
+/// notifications (e.g. progress) during the call; arity is detected at
+/// comptime. The per-call Context is valid only for the duration of the call.
 ///
 /// Lifecycle hook (optional), called after a successful `initialize` with the
 /// parsed client params (negotiated version, client capabilities, client info):
@@ -307,6 +310,14 @@ pub fn Server(comptime Handler: type) type {
         }
 
         pub fn handleRequest(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
+            return self.handleRequestWithContext(req, writer, self.context);
+        }
+
+        /// Like `handleRequest`, but with an explicit per-request context for
+        /// notifications the handler sends during the call (used by the HTTP
+        /// transport to route them to the right stream). `null` falls back to
+        /// a context that writes to `writer`.
+        pub fn handleRequestWithContext(self: *Self, req: json_rpc.Request, writer: *Io.Writer, ctx: ?Context) !void {
             const hash = methodHash(req.method);
 
             if (hash == comptime methodHash("ping")) {
@@ -340,7 +351,7 @@ pub fn Server(comptime Handler: type) type {
 
             if (hash == comptime methodHash("tools/call")) {
                 if (comptime @hasDecl(Handler, "callTool")) {
-                    return self.dispatchToolCall(req, writer);
+                    return self.dispatchToolCall(req, writer, ctx);
                 }
                 return json_rpc.sendError(req.id, .method_not_found, null, writer);
             }
@@ -445,7 +456,11 @@ pub fn Server(comptime Handler: type) type {
             try json_rpc.sendEmptyResult(req.id, writer);
         }
 
-        fn dispatchToolCall(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
+        /// Dispatch tools/call. `callTool` may take `(self, Allocator, params)`
+        /// or, to send notifications (e.g. progress) during the call,
+        /// `(self, Allocator, Context, params)`; the arity is detected at
+        /// comptime. The context is valid only for the duration of the call.
+        fn dispatchToolCall(self: *Self, req: json_rpc.Request, writer: *Io.Writer, ctx: ?Context) !void {
             var arena = ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -458,7 +473,14 @@ pub fn Server(comptime Handler: type) type {
                 return json_rpc.sendError(req.id, .invalid_params, null, writer);
             };
 
-            const result = self.handler.callTool(arena.allocator(), params) catch {
+            const takes_ctx = @typeInfo(@TypeOf(Handler.callTool)).@"fn".params.len == 4;
+
+            const call_result = if (comptime takes_ctx) blk: {
+                const call_ctx = ctx orelse Context{ .sink = .{ .writer = writer } };
+                break :blk self.handler.callTool(arena.allocator(), call_ctx, params);
+            } else self.handler.callTool(arena.allocator(), params);
+
+            const result = call_result catch {
                 const error_result = types.CallToolResult{
                     .content = &.{types.Content.text_content("tool execution failed")},
                     .isError = true,
@@ -718,6 +740,51 @@ test "server handles invalid json gracefully" {
     const ping_parsed = try json_rpc.parseMessage(testing.allocator, ping_line);
     defer ping_parsed.deinit();
     try testing.expect(ping_parsed.value == .response);
+}
+
+const ProgressHandler = struct {
+    pub fn callTool(_: *ProgressHandler, allocator: Allocator, ctx: Context, params: types.CallToolParams) !types.CallToolResult {
+        if (params.progressToken()) |token| {
+            try ctx.sendProgress(.{ .progressToken = token, .progress = 1.0, .total = 1.0 });
+        }
+        return types.CallToolResult.text(allocator, "done");
+    }
+};
+
+test "4-arg callTool receives a context and interleaves progress before the response" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"tools/call","params":{"name":"t","_meta":{"progressToken":"tok"}},"id":2}
+    ++ "\n";
+
+    var handler = ProgressHandler{};
+    var s = Server(ProgressHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-progress", .version = "0.1.0" },
+        .capabilities = .{ .tools = .{} },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var result: TestOutput = .{};
+    var writer = Io.Writer.fixed(&result.buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+    result.len = writer.end;
+    const output = result.slice();
+
+    // Line 1 (after the initialize response) is the progress notification,
+    // line 2 the tool result: progress arrives before the response.
+    const progress_line = getResponseLine(output, 1) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, progress_line, "\"method\":\"notifications/progress\"") != null);
+    try testing.expect(mem.indexOf(u8, progress_line, "\"progressToken\":\"tok\"") != null);
+
+    const result_line = getResponseLine(output, 2) orelse return error.MissingOutput;
+    try testing.expect(mem.indexOf(u8, result_line, "\"done\"") != null);
 }
 
 const PaginatedHandler = struct {
