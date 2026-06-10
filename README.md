@@ -150,6 +150,12 @@ const Tools = mcp.ToolPack(.{ some_lib.tool_defs, my_defs });
 
 Duplicate tool names across packs are a compile error. Unknown tool names and arguments that fail validation are returned to the client as `isError` results.
 
+Tools that share mutable state (a database handle, a client connection) use `mcp.StatefulToolPack(State, defs)`: the pack holds a `state: *State` and passes it as the handlers' first parameter:
+
+```zig
+fn record(self: *Bridge, allocator: Allocator, args: RecordArgs) !types.CallToolResult
+```
+
 ## Handler Methods
 
 Implement only what your server supports and declare the matching capabilities.

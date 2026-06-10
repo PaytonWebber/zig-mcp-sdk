@@ -74,29 +74,7 @@ pub const ToolContext = struct {
 ///   .annotations (optional) types.ToolAnnotations
 pub fn ToolPack(comptime defs: anytype) type {
     const groups = if (@typeInfo(@TypeOf(defs)).@"struct".is_tuple) defs else .{defs};
-
-    const tools_list: []const types.Tool = comptime blk: {
-        var list: []const types.Tool = &.{};
-        for (@typeInfo(@TypeOf(groups)).@"struct".fields) |group_field| {
-            const group = @field(groups, group_field.name);
-            for (@typeInfo(@TypeOf(group)).@"struct".fields) |tool_field| {
-                const def = @field(group, tool_field.name);
-                validateDef(tool_field.name, def);
-                for (list) |existing| {
-                    if (mem.eql(u8, existing.name, tool_field.name)) {
-                        @compileError("ToolPack: duplicate tool name '" ++ tool_field.name ++ "'");
-                    }
-                }
-                list = list ++ &[_]types.Tool{.{
-                    .name = tool_field.name,
-                    .description = def.description,
-                    .inputSchema = types.schemaForStruct(ArgsOf(def)),
-                    .annotations = annotationsOf(def),
-                }};
-            }
-        }
-        break :blk list;
-    };
+    const tools_list = comptime buildToolsList(groups);
 
     return struct {
         const Self = @This();
@@ -166,6 +144,89 @@ fn validateDef(comptime name: []const u8, comptime def: anytype) void {
     if (!@hasField(@TypeOf(def), "description")) {
         @compileError("ToolPack: tool '" ++ name ++ "' is missing .description");
     }
+}
+
+/// Comptime construction of the `tools/list` array shared by both pack
+/// flavors. The args struct is the handler's final parameter in all forms.
+fn buildToolsList(comptime groups: anytype) []const types.Tool {
+    var list: []const types.Tool = &.{};
+    for (@typeInfo(@TypeOf(groups)).@"struct".fields) |group_field| {
+        const group = @field(groups, group_field.name);
+        for (@typeInfo(@TypeOf(group)).@"struct".fields) |tool_field| {
+            const def = @field(group, tool_field.name);
+            validateDef(tool_field.name, def);
+            for (list) |existing| {
+                if (mem.eql(u8, existing.name, tool_field.name)) {
+                    @compileError("ToolPack: duplicate tool name '" ++ tool_field.name ++ "'");
+                }
+            }
+            list = list ++ &[_]types.Tool{.{
+                .name = tool_field.name,
+                .description = def.description,
+                .inputSchema = types.schemaForStruct(ArgsOf(def)),
+                .annotations = annotationsOf(def),
+            }};
+        }
+    }
+    return list;
+}
+
+/// Like `ToolPack`, but for tools that share mutable state (a database
+/// handle, a daemon client, configuration). The generated struct holds a
+/// `state: *State` field and passes it as the handlers' first parameter:
+///
+///     fn (*State, Allocator, Args) !types.CallToolResult
+///     fn (*State, Allocator, ToolContext, Args) !types.CallToolResult
+///
+/// Usage:
+///
+///     const Tools = mcp.StatefulToolPack(Bridge, .{
+///         .record = .{ .description = "...", .handler = Bridge.record },
+///     });
+///     var tools = Tools{ .state = &bridge };
+///     var server = mcp.Server(Tools).init(allocator, &tools, .{ ... });
+pub fn StatefulToolPack(comptime State: type, comptime defs: anytype) type {
+    const groups = if (@typeInfo(@TypeOf(defs)).@"struct".is_tuple) defs else .{defs};
+    const tools_list = comptime buildToolsList(groups);
+
+    return struct {
+        const Self = @This();
+
+        state: *State,
+
+        pub fn listTools(_: *Self, _: Allocator) !types.ListToolsResult {
+            return .{ .tools = tools_list };
+        }
+
+        pub fn callTool(self: *Self, allocator: Allocator, ctx: server_mod.Context, params: types.CallToolParams) !types.CallToolResult {
+            inline for (@typeInfo(@TypeOf(groups)).@"struct".fields) |group_field| {
+                const group = @field(groups, group_field.name);
+                inline for (@typeInfo(@TypeOf(group)).@"struct".fields) |tool_field| {
+                    if (mem.eql(u8, params.name, tool_field.name)) {
+                        const def = comptime @field(group, tool_field.name);
+                        const Args = ArgsOf(def);
+
+                        const args = types.parseArgs(Args, allocator, params.arguments) catch {
+                            return types.CallToolResult.err(
+                                allocator,
+                                "invalid arguments for tool '" ++ tool_field.name ++ "'",
+                            );
+                        };
+
+                        const handler_params = @typeInfo(@TypeOf(def.handler)).@"fn".params;
+                        if (comptime handler_params.len == 4) {
+                            const tool_ctx = ToolContext{ .context = ctx, .params = params };
+                            return try def.handler(self.state, allocator, tool_ctx, args);
+                        }
+                        return try def.handler(self.state, allocator, args);
+                    }
+                }
+            }
+
+            const msg = try std.fmt.allocPrint(allocator, "unknown tool: {s}", .{params.name});
+            return types.CallToolResult.err(allocator, msg);
+        }
+    };
 }
 
 // ============================================================================
@@ -326,6 +387,74 @@ test "ToolPack: composes def groups from a tuple" {
     try testing.expectEqual(@as(usize, 2), result.tools.len);
     try testing.expectEqualStrings("echo", result.tools[0].name);
     try testing.expectEqualStrings("ping_tool", result.tools[1].name);
+}
+
+const Counter = struct {
+    count: u32 = 0,
+    label: []const u8,
+
+    fn bump(self: *Counter, allocator: Allocator, args: struct { by: u32 = 1 }) !types.CallToolResult {
+        self.count += args.by;
+        return types.CallToolResult.text(allocator, try std.fmt.allocPrint(allocator, "{s}: {d}", .{ self.label, self.count }));
+    }
+
+    fn bumpWithProgress(self: *Counter, allocator: Allocator, tc: ToolContext, args: struct { by: u32 = 1 }) !types.CallToolResult {
+        try tc.sendProgress(1.0, 1.0);
+        return self.bump(allocator, .{ .by = args.by });
+    }
+};
+
+const CounterPack = StatefulToolPack(Counter, .{
+    .bump = .{ .description = "Increment the counter", .handler = Counter.bump },
+    .bump_loud = .{ .description = "Increment with progress", .handler = Counter.bumpWithProgress },
+});
+
+test "StatefulToolPack: handlers receive the shared state" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var out = Io.Writer.fixed(&out_buf);
+
+    var counter = Counter{ .label = "hits" };
+    var pack = CounterPack{ .state = &counter };
+    const ctx = server_mod.Context{ .sink = .{ .writer = &out } };
+
+    const val = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"name":"bump","arguments":{"by":2}}
+    , .{});
+    const params = try types.CallToolParams.fromJson(val);
+    const result = try pack.callTool(arena.allocator(), ctx, params);
+
+    try testing.expectEqualStrings("hits: 2", result.content[0].text.text);
+    try testing.expectEqual(@as(u32, 2), counter.count);
+
+    // Second call sees the mutated state.
+    const again = try pack.callTool(arena.allocator(), ctx, params);
+    try testing.expectEqualStrings("hits: 4", again.content[0].text.text);
+}
+
+test "StatefulToolPack: ToolContext form and listTools work" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var out_buf: [4096]u8 = undefined;
+    var out = Io.Writer.fixed(&out_buf);
+
+    var counter = Counter{ .label = "n" };
+    var pack = CounterPack{ .state = &counter };
+
+    const listed = try pack.listTools(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), listed.tools.len);
+    try testing.expect(mem.indexOf(u8, listed.tools[0].inputSchema.?, "\"by\":{\"type\":\"integer\",\"default\":1}") != null);
+
+    const val = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"name":"bump_loud","_meta":{"progressToken":1}}
+    , .{});
+    const params = try types.CallToolParams.fromJson(val);
+    const ctx = server_mod.Context{ .sink = .{ .writer = &out } };
+    _ = try pack.callTool(arena.allocator(), ctx, params);
+
+    try testing.expectEqual(@as(u32, 1), counter.count);
+    try testing.expect(mem.indexOf(u8, out_buf[0..out.end], "\"method\":\"notifications/progress\"") != null);
 }
 
 test "ToolPack: works directly as a Server handler" {

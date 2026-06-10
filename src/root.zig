@@ -13,6 +13,7 @@ pub const http_transport = @import("http_transport.zig");
 pub const HttpTransport = http_transport.HttpTransport;
 pub const tool_pack = @import("tool_pack.zig");
 pub const ToolPack = tool_pack.ToolPack;
+pub const StatefulToolPack = tool_pack.StatefulToolPack;
 pub const ToolContext = tool_pack.ToolContext;
 
 test {

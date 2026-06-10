@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Until 1.0.0, minor versions may contain breaking changes.
 
+## [0.5.0] - 2026-06-10
+
+### Added
+
+- `mcp.StatefulToolPack(State, defs)`: tool packs whose handlers share
+  mutable state. The generated struct holds `state: *State` and passes it as
+  the handlers' first parameter (`fn(*State, Allocator, [ToolContext,] Args)`).
+  Motivated by real servers (a daemon client, a database handle) that the
+  stateless `ToolPack` could not express without globals.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added
@@ -110,6 +120,7 @@ First tagged release.
 - Examples: greeter (stdio), greeter (HTTP), channel server.
 - MCP stdio conformance script (`scripts/conformance.sh`) run in CI.
 
+[0.5.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.5.0
 [0.4.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.3.0
 [0.2.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.2.0
