@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const Io = std.Io;
@@ -16,6 +15,12 @@ const json_content_type: http.Header = .{ .name = "content-type", .value = "appl
 pub const HttpOptions = struct {
     port: u16 = 8080,
     address: []const u8 = "127.0.0.1",
+    /// Largest accepted POST body. Oversized requests get 413 and the
+    /// connection is closed.
+    max_body_size: usize = 1024 * 1024,
+    /// Origins allowed in addition to localhost (DNS rebinding protection).
+    /// Requests without an Origin header (non-browser clients) always pass.
+    allowed_origins: []const []const u8 = &.{},
 };
 
 /// Streamable HTTP transport for an MCP server (Phase A: POST + JSON only).
@@ -46,7 +51,9 @@ pub fn HttpTransport(comptime Handler: type) type {
 
         const HeaderInfo = struct {
             accept_json: bool,
+            content_type_json: bool,
             session_id: ?[]const u8,
+            origin: ?[]const u8,
         };
 
         pub fn init(allocator: Allocator, server: *ServerType, options: HttpOptions) Self {
@@ -87,13 +94,15 @@ pub fn HttpTransport(comptime Handler: type) type {
                     error.HttpConnectionClosing => return,
                     else => return err,
                 };
-                self.handleHttpRequest(&parse_arena, &request) catch continue;
+                // Errors mid-request leave the connection in an unknown state;
+                // close it rather than parse leftover bytes as the next request.
+                self.handleHttpRequest(&parse_arena, &request, io) catch return;
             }
         }
 
-        fn handleHttpRequest(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request) !void {
+        fn handleHttpRequest(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request, io: Io) !void {
             switch (request.head.method) {
-                .POST => try self.handlePost(parse_arena, request),
+                .POST => try self.handlePost(parse_arena, request, io),
                 .DELETE => try self.handleDelete(request),
                 else => try request.respond("", .{ .status = .method_not_allowed }),
             }
@@ -103,11 +112,41 @@ pub fn HttpTransport(comptime Handler: type) type {
         // POST handler
         // =================================================================
 
-        fn handlePost(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request) !void {
+        fn handlePost(self: *Self, parse_arena: *ArenaAllocator, request: *http.Server.Request, io: Io) !void {
             defer _ = parse_arena.reset(.retain_capacity);
 
             // Single pass over headers before reading body (iterateHeaders requires received_head state)
             const headers = extractHeaders(request);
+
+            const session_invalid = self.session != null and
+                (headers.session_id == null or !mem.eql(u8, headers.session_id.?, &self.session.?.id));
+
+            // Read the body before any validation response so rejected requests
+            // don't leave unread bytes on a keep-alive connection.
+            var body_buf: [64 * 1024]u8 = undefined;
+            const body_reader = try request.readerExpectContinue(&body_buf);
+            const body = body_reader.allocRemaining(self.allocator, Io.Limit.limited(self.options.max_body_size)) catch |err| switch (err) {
+                error.StreamTooLong => {
+                    try request.respond(
+                        \\{"error":"Request body too large"}
+                    , .{
+                        .status = .payload_too_large,
+                        .extra_headers = &.{json_content_type},
+                    });
+                    return error.BodyTooLarge;
+                },
+                else => return err,
+            };
+            defer self.allocator.free(body);
+
+            if (!self.originAllowed(headers.origin)) {
+                return request.respond(
+                    \\{"error":"Origin not allowed"}
+                , .{
+                    .status = .forbidden,
+                    .extra_headers = &.{json_content_type},
+                });
+            }
 
             if (!headers.accept_json) {
                 return request.respond(
@@ -118,14 +157,14 @@ pub fn HttpTransport(comptime Handler: type) type {
                 });
             }
 
-            const session_invalid = self.session != null and
-                (headers.session_id == null or !mem.eql(u8, headers.session_id.?, &self.session.?.id));
-
-            // Read body
-            var body_buf: [64 * 1024]u8 = undefined;
-            const body_reader = try request.readerExpectContinue(&body_buf);
-            const body = try body_reader.allocRemaining(self.allocator, Io.Limit.limited(1024 * 1024));
-            defer self.allocator.free(body);
+            if (!headers.content_type_json) {
+                return request.respond(
+                    \\{"error":"Content-Type must be application/json"}
+                , .{
+                    .status = .unsupported_media_type,
+                    .extra_headers = &.{json_content_type},
+                });
+            }
 
             if (session_invalid) {
                 return request.respond(
@@ -157,7 +196,7 @@ pub fn HttpTransport(comptime Handler: type) type {
                     .extra_headers = &.{json_content_type},
                 });
             } else {
-                try self.handlePreSession(message, request);
+                try self.handlePreSession(message, request, io);
             }
         }
 
@@ -165,7 +204,7 @@ pub fn HttpTransport(comptime Handler: type) type {
         // Session state handlers
         // =================================================================
 
-        fn handlePreSession(self: *Self, msg: json_rpc.Message, request: *http.Server.Request) !void {
+        fn handlePreSession(self: *Self, msg: json_rpc.Message, request: *http.Server.Request, io: Io) !void {
             switch (msg) {
                 .request => |req| {
                     if (mem.eql(u8, req.method, "initialize")) {
@@ -182,13 +221,17 @@ pub fn HttpTransport(comptime Handler: type) type {
                                 .extra_headers = &.{json_content_type},
                             });
                         };
+                        const session_id = generateSessionId(io) catch {
+                            return request.respond("", .{ .status = .internal_server_error });
+                        };
+
                         self.server.applyInitializeParams(params);
                         const result = self.server.initializeResult();
                         const bytes = try json_rpc.serializeResult(self.allocator, req.id, result);
                         defer self.allocator.free(bytes);
 
                         self.session = .{
-                            .id = generateSessionId(),
+                            .id = session_id,
                             .state = .awaiting_initialized,
                         };
 
@@ -255,8 +298,9 @@ pub fn HttpTransport(comptime Handler: type) type {
                     var response_buf: [256 * 1024]u8 = undefined;
                     var writer = Io.Writer.fixed(&response_buf);
 
-                    self.server.handleRequest(req, &writer) catch |err| {
-                        json_rpc.sendError(req.id, .internal_error, @errorName(err), &writer) catch {};
+                    self.server.handleRequest(req, &writer) catch {
+                        // Don't leak internal Zig error names to the client.
+                        json_rpc.sendError(req.id, .internal_error, null, &writer) catch {};
                     };
 
                     const written = response_buf[0..writer.end];
@@ -321,7 +365,12 @@ pub fn HttpTransport(comptime Handler: type) type {
         }
 
         fn extractHeaders(request: *const http.Server.Request) HeaderInfo {
-            var result = HeaderInfo{ .accept_json = false, .session_id = null };
+            var result = HeaderInfo{
+                .accept_json = false,
+                .content_type_json = false,
+                .session_id = null,
+                .origin = null,
+            };
             var it = request.iterateHeaders();
             while (it.next()) |header| {
                 if (std.ascii.eqlIgnoreCase(header.name, "accept")) {
@@ -330,20 +379,88 @@ pub fn HttpTransport(comptime Handler: type) type {
                     {
                         result.accept_json = true;
                     }
+                } else if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                    if (mem.indexOf(u8, header.value, "application/json") != null) {
+                        result.content_type_json = true;
+                    }
                 } else if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) {
                     result.session_id = header.value;
+                } else if (std.ascii.eqlIgnoreCase(header.name, "origin")) {
+                    result.origin = header.value;
                 }
             }
             return result;
         }
 
-        fn generateSessionId() [32]u8 {
-            var bytes: [16]u8 = undefined;
-            switch (comptime builtin.os.tag) {
-                .linux => _ = std.os.linux.getrandom(&bytes, bytes.len, 0),
-                else => @compileError("HttpTransport requires Linux (getrandom syscall)"),
+        /// DNS rebinding protection (required by the MCP spec). Requests
+        /// without an Origin header come from non-browser clients and pass.
+        /// Browser requests must originate from localhost or an entry in
+        /// `allowed_origins`.
+        fn originAllowed(self: *const Self, origin: ?[]const u8) bool {
+            const o = origin orelse return true;
+            for (self.options.allowed_origins) |allowed| {
+                if (std.ascii.eqlIgnoreCase(o, allowed)) return true;
             }
+            return isLocalOrigin(o);
+        }
+
+        fn isLocalOrigin(origin: []const u8) bool {
+            const scheme_end = mem.indexOf(u8, origin, "://") orelse return false;
+            const rest = origin[scheme_end + 3 ..];
+            const host = if (rest.len > 0 and rest[0] == '[')
+                rest[0 .. (mem.indexOfScalar(u8, rest, ']') orelse return false) + 1]
+            else if (mem.indexOfScalar(u8, rest, ':')) |colon|
+                rest[0..colon]
+            else
+                rest;
+            return std.ascii.eqlIgnoreCase(host, "localhost") or
+                mem.eql(u8, host, "127.0.0.1") or
+                mem.eql(u8, host, "[::1]");
+        }
+
+        fn generateSessionId(io: Io) ![32]u8 {
+            var bytes: [16]u8 = undefined;
+            try io.randomSecure(&bytes);
             return std.fmt.bytesToHex(bytes, .lower);
         }
     };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+const NoopHandler = struct {};
+
+const TestTransport = HttpTransport(NoopHandler);
+
+test "isLocalOrigin accepts localhost variants and rejects others" {
+    try testing.expect(TestTransport.isLocalOrigin("http://localhost"));
+    try testing.expect(TestTransport.isLocalOrigin("http://localhost:8080"));
+    try testing.expect(TestTransport.isLocalOrigin("https://LOCALHOST:3000"));
+    try testing.expect(TestTransport.isLocalOrigin("http://127.0.0.1:8080"));
+    try testing.expect(TestTransport.isLocalOrigin("http://[::1]"));
+    try testing.expect(TestTransport.isLocalOrigin("http://[::1]:8080"));
+
+    try testing.expect(!TestTransport.isLocalOrigin("http://evil.example"));
+    try testing.expect(!TestTransport.isLocalOrigin("http://localhost.evil.example"));
+    try testing.expect(!TestTransport.isLocalOrigin("http://127.0.0.1.evil.example"));
+    try testing.expect(!TestTransport.isLocalOrigin("localhost"));
+}
+
+test "originAllowed honors the allowlist and missing Origin" {
+    var handler = NoopHandler{};
+    var server = server_mod.Server(NoopHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "t", .version = "0" },
+    });
+    var transport = TestTransport.init(testing.allocator, &server, .{
+        .allowed_origins = &.{"https://app.example.com"},
+    });
+
+    try testing.expect(transport.originAllowed(null));
+    try testing.expect(transport.originAllowed("http://localhost:8080"));
+    try testing.expect(transport.originAllowed("https://app.example.com"));
+    try testing.expect(!transport.originAllowed("https://evil.example.com"));
 }

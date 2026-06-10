@@ -25,6 +25,12 @@ pub const Context = struct {
     pub fn sendNotification(self: Context, method: []const u8, params: anytype) !void {
         try json_rpc.sendNotification(method, params, self.writer);
     }
+
+    /// Send a `notifications/message` log entry to the client.
+    /// Declare `.logging = .{}` in the server capabilities when using this.
+    pub fn sendLogMessage(self: Context, params: types.LogMessageParams) !void {
+        try json_rpc.sendNotification(types.log_message_method, params, self.writer);
+    }
 };
 
 /// Options for creating an MCP server.
@@ -46,6 +52,7 @@ pub const Options = struct {
 ///   fn readResource(*Handler, Allocator, types.ReadResourceParams) !types.ReadResourceResult
 ///   fn listPrompts(*Handler, Allocator) !types.ListPromptsResult
 ///   fn getPrompt(*Handler, Allocator, types.GetPromptParams) !types.GetPromptResult
+///   fn setLoggingLevel(*Handler, types.LoggingLevel) void
 ///
 /// Lifecycle hook (optional), called after a successful `initialize` with the
 /// parsed client params (negotiated version, client capabilities, client info):
@@ -302,6 +309,13 @@ pub fn Server(comptime Handler: type) type {
                 return json_rpc.sendError(req.id, .method_not_found, null, writer);
             }
 
+            if (hash == comptime methodHash("logging/setLevel")) {
+                if (comptime @hasDecl(Handler, "setLoggingLevel")) {
+                    return self.dispatchSetLevel(req, writer);
+                }
+                return json_rpc.sendError(req.id, .method_not_found, null, writer);
+            }
+
             return json_rpc.sendError(req.id, .method_not_found, null, writer);
         }
 
@@ -353,6 +367,20 @@ pub fn Server(comptime Handler: type) type {
                 return json_rpc.sendError(req.id, .internal_error, null, writer);
             };
             try json_rpc.sendResult(req.id, result, writer);
+        }
+
+        fn dispatchSetLevel(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
+            const params = types.SetLevelParams.fromJson(req.params orelse return json_rpc.sendError(
+                req.id,
+                .invalid_params,
+                null,
+                writer,
+            )) catch {
+                return json_rpc.sendError(req.id, .invalid_params, null, writer);
+            };
+
+            self.handler.setLoggingLevel(params.level);
+            try json_rpc.sendEmptyResult(req.id, writer);
         }
 
         fn dispatchToolCall(self: *Self, req: json_rpc.Request, writer: *Io.Writer) !void {
@@ -628,6 +656,73 @@ test "server handles invalid json gracefully" {
     const ping_parsed = try json_rpc.parseMessage(testing.allocator, ping_line);
     defer ping_parsed.deinit();
     try testing.expect(ping_parsed.value == .response);
+}
+
+test "server without setLoggingLevel returns method_not_found" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"logging/setLevel","params":{"level":"debug"},"id":6}
+    ++ "\n";
+
+    var result = try runTestServer(input);
+    const line = getResponseLine(result.slice(), 1) orelse return error.MissingOutput;
+    const parsed = try json_rpc.parseMessage(testing.allocator, line);
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .error_response);
+    try testing.expectEqual(@as(i32, -32601), parsed.value.error_response.@"error".code);
+}
+
+const LoggingHandler = struct {
+    level: ?types.LoggingLevel = null,
+
+    pub fn setLoggingLevel(self: *LoggingHandler, level: types.LoggingLevel) void {
+        self.level = level;
+    }
+};
+
+test "server routes logging/setLevel to the handler" {
+    const input =
+        \\{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":1}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"logging/setLevel","params":{"level":"warning"},"id":7}
+    ++ "\n" ++
+        \\{"jsonrpc":"2.0","method":"logging/setLevel","params":{"level":"nope"},"id":8}
+    ++ "\n";
+
+    var handler = LoggingHandler{};
+    var s = Server(LoggingHandler).init(testing.allocator, &handler, .{
+        .server_info = .{ .name = "test-logging", .version = "0.1.0" },
+        .capabilities = .{ .logging = .{} },
+    });
+
+    var reader = Io.Reader.fixed(input);
+    var result: TestOutput = .{};
+    var writer = Io.Writer.fixed(&result.buf);
+
+    s.run(&reader, &writer) catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
+    result.len = writer.end;
+    const output = result.slice();
+
+    try testing.expectEqual(types.LoggingLevel.warning, handler.level.?);
+
+    const ok_line = getResponseLine(output, 1) orelse return error.MissingOutput;
+    const ok_parsed = try json_rpc.parseMessage(testing.allocator, ok_line);
+    defer ok_parsed.deinit();
+    try testing.expect(ok_parsed.value == .response);
+
+    const bad_line = getResponseLine(output, 2) orelse return error.MissingOutput;
+    const bad_parsed = try json_rpc.parseMessage(testing.allocator, bad_line);
+    defer bad_parsed.deinit();
+    try testing.expect(bad_parsed.value == .error_response);
+    try testing.expectEqual(@as(i32, -32602), bad_parsed.value.error_response.@"error".code);
 }
 
 // ============================================================================

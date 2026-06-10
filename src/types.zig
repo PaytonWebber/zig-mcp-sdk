@@ -78,7 +78,11 @@ pub const schemaForStruct = @import("types/schema.zig").schemaForStruct;
 pub const parseArgs = @import("types/json_utils.zig").parseArgs;
 
 // Logging
-pub const LoggingLevel = @import("types/logging.zig").LoggingLevel;
+const logging_mod = @import("types/logging.zig");
+pub const LoggingLevel = logging_mod.LoggingLevel;
+pub const SetLevelParams = logging_mod.SetLevelParams;
+pub const LogMessageParams = logging_mod.LogMessageParams;
+pub const log_message_method = logging_mod.log_message_method;
 
 // Initialize
 const init = @import("types/initialize.zig");
