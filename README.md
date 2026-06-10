@@ -10,12 +10,17 @@ const HelloArgs = struct {
     pub const descriptions = .{ .name = "Name to greet" };
 };
 
-// In listTools:
-.inputSchema = comptime types.schemaForStruct(HelloArgs),
+fn hello(allocator: Allocator, args: HelloArgs) !types.CallToolResult {
+    const msg = try std.fmt.allocPrint(allocator, "Hello, {s}!", .{args.name});
+    return types.CallToolResult.text(allocator, msg);
+}
 
-// In callTool:
-const args = try types.parseArgs(HelloArgs, allocator, params.arguments);
+const MyTools = mcp.ToolPack(.{
+    .hello = .{ .description = "Say hello", .handler = hello },
+});
 ```
+
+That is a complete tool server. The JSON Schema, the `tools/list` entry, name dispatch, and typed argument parsing are all generated at compile time from the handler's signature, so the schema and the parser cannot drift apart.
 
 A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build servers that expose tools, resources, and prompts to AI agents over **stdio** (local) or **Streamable HTTP** (remote).
 
@@ -47,9 +52,9 @@ const mcp_dep = b.dependency("zig_mcp_sdk", .{
 exe.root_module.addImport("zig_mcp_sdk", mcp_dep.module("zig_mcp_sdk"));
 ```
 
-### 2. Define a handler
+### 2. Define your tools
 
-A handler is a plain struct that implements the MCP methods you want to support. All methods are optional.
+Declare an args struct and a handler function per tool, then register them in a `ToolPack`:
 
 ```zig
 const std = @import("std");
@@ -62,30 +67,17 @@ const HelloArgs = struct {
     pub const descriptions = .{ .name = "Name to greet" };
 };
 
-const MyHandler = struct {
-    pub fn listTools(_: *MyHandler, _: Allocator) !types.ListToolsResult {
-        return .{
-            .tools = &.{
-                .{
-                    .name = "hello",
-                    .description = "Say hello",
-                    .inputSchema = comptime types.schemaForStruct(HelloArgs),
-                },
-            },
-        };
-    }
+fn hello(allocator: Allocator, args: HelloArgs) !types.CallToolResult {
+    const msg = try std.fmt.allocPrint(allocator, "Hello, {s}!", .{args.name});
+    return types.CallToolResult.text(allocator, msg);
+}
 
-    pub fn callTool(_: *MyHandler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
-        if (std.mem.eql(u8, params.name, "hello")) {
-            const args = try types.parseArgs(HelloArgs, allocator, params.arguments);
-            const msg = try std.fmt.allocPrint(allocator, "Hello, {s}!", .{args.name});
-            return types.CallToolResult.text(allocator, msg);
-        }
-
-        return error.ToolNotFound;
-    }
-};
+const MyTools = mcp.ToolPack(.{
+    .hello = .{ .description = "Say hello", .handler = hello },
+});
 ```
+
+A `ToolPack` implements `listTools` and `callTool`, so it can serve as the handler by itself. Servers that also expose resources or prompts write a handler struct and embed the pack; see [`examples/greeter.zig`](examples/greeter.zig).
 
 ### 3. Start the server
 
@@ -95,8 +87,8 @@ Stdio transport (Claude Desktop, Claude Code, Cursor):
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
-    var handler = MyHandler{};
-    var server = mcp.Server(MyHandler).init(allocator, &handler, .{
+    var tools = MyTools{};
+    var server = mcp.Server(MyTools).init(allocator, &tools, .{
         .server_info = .{ .name = "my-server", .version = "0.1.0" },
         .capabilities = .{ .tools = .{} },
     });
@@ -111,19 +103,46 @@ HTTP transport (remote or cloud deployment). Connections are handled concurrentl
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
 
-    var handler = MyHandler{};
-    var server = mcp.Server(MyHandler).init(allocator, &handler, .{
+    var tools = MyTools{};
+    var server = mcp.Server(MyTools).init(allocator, &tools, .{
         .server_info = .{ .name = "my-server", .version = "0.1.0" },
         .capabilities = .{ .tools = .{} },
     });
 
-    var transport = mcp.HttpTransport(MyHandler).init(allocator, &server, .{
+    var transport = mcp.HttpTransport(MyTools).init(allocator, &server, .{
         .port = 8080,
     });
     defer transport.deinit();
     try transport.listen(init.io);
 }
 ```
+
+## Tool Packs
+
+`mcp.ToolPack` generates `listTools` and `callTool` from one declaration per tool. Each def takes a `.description` and a `.handler`; the handler's args struct drives the schema and the parsing. Optional fields: `.args` to name the struct explicitly, `.annotations` for `types.ToolAnnotations`.
+
+Handlers come in two forms, detected at compile time:
+
+```zig
+fn simple(allocator: Allocator, args: MyArgs) !types.CallToolResult
+fn withContext(allocator: Allocator, tc: mcp.ToolContext, args: MyArgs) !types.CallToolResult
+```
+
+`ToolContext` carries the per-call notification context. `tc.sendProgress(i, total)` reports progress and is a no-op when the client did not send a progress token, so handlers call it unconditionally. Over HTTP, progress streams on the POST's own SSE response.
+
+Packs compose. A library can export its defs, and an application mounts several at once:
+
+```zig
+// in a library:
+pub const tool_defs = .{
+    .search = .{ .description = "Search the index", .handler = search },
+};
+
+// in the application:
+const Tools = mcp.ToolPack(.{ some_lib.tool_defs, my_defs });
+```
+
+Duplicate tool names across packs are a compile error. Unknown tool names and arguments that fail validation are returned to the client as `isError` results.
 
 ## Handler Methods
 

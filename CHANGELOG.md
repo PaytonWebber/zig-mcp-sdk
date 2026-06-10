@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Until 1.0.0, minor versions may contain breaking changes.
 
+## [0.4.0] - 2026-06-10
+
+### Added
+
+- `mcp.ToolPack`: comptime tool registry. One declaration per tool
+  (`.description` + `.handler`, optional `.args` and `.annotations`) generates
+  the JSON Schema, the `tools/list` entry, name dispatch, and typed argument
+  parsing from the handler's signature. The generated type implements
+  `listTools`/`callTool`, so it works directly as a `Server` handler or
+  embedded in a larger one.
+- `mcp.ToolContext` for context-taking pack handlers: `sendProgress(i, total)`
+  is a no-op when the client sent no progress token, plus access to the
+  notification context and raw call params.
+- Pack composition: `ToolPack(.{ lib_a.tool_defs, my_defs })` merges def
+  groups; duplicate tool names are a compile error.
+- `types.parseArgs` now treats absent or null `arguments` as an empty object,
+  so tools whose fields all have defaults (or none) need no arguments.
+- Both greeter examples rewritten on tool packs.
+
 ## [0.3.0] - 2026-06-10
 
 ### Added
@@ -91,6 +110,7 @@ First tagged release.
 - Examples: greeter (stdio), greeter (HTTP), channel server.
 - MCP stdio conformance script (`scripts/conformance.sh`) run in CI.
 
+[0.4.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.3.0
 [0.2.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.2.0
 [0.1.0]: https://github.com/PaytonWebber/zig-mcp-sdk/releases/tag/v0.1.0

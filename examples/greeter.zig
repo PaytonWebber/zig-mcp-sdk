@@ -20,47 +20,50 @@ const MultiGreetArgs = struct {
     };
 };
 
-const Handler = struct {
-    pub fn listTools(_: *Handler, _: Allocator) !types.ListToolsResult {
-        return .{
-            .tools = &.{
-                .{
-                    .name = "greet",
-                    .description = "Greet someone by name",
-                    .inputSchema = comptime types.schemaForStruct(GreetArgs),
-                },
-                .{
-                    .name = "multi_greet",
-                    .description = "Greet someone multiple times",
-                    .inputSchema = comptime types.schemaForStruct(MultiGreetArgs),
-                },
-            },
-        };
+// A ToolPack turns one declaration per tool into the schema, the tools/list
+// entry, name dispatch, and typed argument parsing. Handlers are plain
+// functions; the args struct in their signature drives everything.
+const Tools = mcp.ToolPack(.{
+    .greet = .{
+        .description = "Greet someone by name",
+        .handler = greet,
+    },
+    .multi_greet = .{
+        .description = "Greet someone multiple times",
+        .handler = multiGreet,
+    },
+});
+
+fn greet(allocator: Allocator, args: GreetArgs) !types.CallToolResult {
+    const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}! Welcome to the Zig MCP SDK.", .{args.name});
+    return types.CallToolResult.text(allocator, greeting);
+}
+
+fn multiGreet(allocator: Allocator, args: MultiGreetArgs) !types.CallToolResult {
+    if (args.count < 1 or args.count > 100) {
+        return types.CallToolResult.err(allocator, "count must be between 1 and 100");
     }
 
-    pub fn callTool(_: *Handler, allocator: Allocator, params: types.CallToolParams) !types.CallToolResult {
-        if (std.mem.eql(u8, params.name, "greet")) {
-            const args = try types.parseArgs(GreetArgs, allocator, params.arguments);
-            const greeting = try std.fmt.allocPrint(allocator, "Hello, {s}! Welcome to the Zig MCP SDK.", .{args.name});
-            return types.CallToolResult.text(allocator, greeting);
-        }
+    const content = try allocator.alloc(types.Content, args.count);
+    for (content, 1..) |*item, i| {
+        item.* = types.Content.text_content(
+            try std.fmt.allocPrint(allocator, "Greeting {d}: Hello, {s}!", .{ i, args.name }),
+        );
+    }
+    return .{ .content = content };
+}
 
-        if (std.mem.eql(u8, params.name, "multi_greet")) {
-            const args = try types.parseArgs(MultiGreetArgs, allocator, params.arguments);
-            if (args.count < 1 or args.count > 100) {
-                return types.CallToolResult.err(allocator, "count must be between 1 and 100");
-            }
+// The pack could be the Server handler by itself; embedding it instead shows
+// how to combine pack-driven tools with hand-written resources and prompts.
+const Handler = struct {
+    tools: Tools = .{},
 
-            const content = try allocator.alloc(types.Content, args.count);
-            for (content, 1..) |*item, i| {
-                item.* = types.Content.text_content(
-                    try std.fmt.allocPrint(allocator, "Greeting {d}: Hello, {s}!", .{ i, args.name }),
-                );
-            }
-            return .{ .content = content };
-        }
+    pub fn listTools(self: *Handler, allocator: Allocator) !types.ListToolsResult {
+        return self.tools.listTools(allocator);
+    }
 
-        return error.ToolNotFound;
+    pub fn callTool(self: *Handler, allocator: Allocator, ctx: mcp.Context, params: types.CallToolParams) !types.CallToolResult {
+        return self.tools.callTool(allocator, ctx, params);
     }
 
     pub fn listResources(_: *Handler, _: Allocator) !types.ListResourcesResult {

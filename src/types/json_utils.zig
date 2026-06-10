@@ -61,10 +61,17 @@ pub const ParseError = error{ InvalidParams, OutOfMemory };
 /// String slices are referenced zero-copy from `args` (which the caller owns for
 /// the request's lifetime); container slices are allocated from `allocator`.
 pub fn parseArgs(comptime T: type, allocator: std.mem.Allocator, args: ?json.Value) ParseError!T {
-    const obj = asObject(args) orelse return error.InvalidParams;
+    // Absent or null arguments are treated as an empty object so that
+    // tools whose fields all have defaults (or none) need no arguments.
+    const obj: ?json.ObjectMap = if (args) |a| switch (a) {
+        .object => |o| o,
+        .null => null,
+        else => return error.InvalidParams,
+    } else null;
+
     var result: T = undefined;
     inline for (@typeInfo(T).@"struct".fields) |field| {
-        const present = obj.get(field.name);
+        const present = if (obj) |o| o.get(field.name) else null;
         if (present == null or present.? == .null) {
             if (field.default_value_ptr) |ptr| {
                 @field(result, field.name) = @as(*const field.type, @ptrCast(@alignCast(ptr))).*;
