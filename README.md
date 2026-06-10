@@ -22,9 +22,14 @@ const MyTools = mcp.ToolPack(.{
 
 That is a complete tool server. The JSON Schema, the `tools/list` entry, name dispatch, and typed argument parsing are all generated at compile time from the handler's signature, so the schema and the parser cannot drift apart.
 
+The schema the model sees, baked into the binary from `HelloArgs`:
+
+```json
+{"type":"object","properties":{"name":{"type":"string","description":"Name to greet"}},"required":["name"]}
+```
+
 A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build servers that expose tools, resources, and prompts to AI agents over **stdio** (local) or **Streamable HTTP** (remote).
 
-- One struct drives both the tool schema and typed argument parsing
 - Request-scoped arena allocators: allocate freely in handlers, freed after the response
 - Zero-copy strings: parsed slices point into arena memory, no duplication
 - Handler methods resolved at comptime via `@hasDecl`, no vtables
@@ -54,27 +59,13 @@ exe.root_module.addImport("zig_mcp_sdk", mcp_dep.module("zig_mcp_sdk"));
 
 ### 2. Define your tools
 
-Declare an args struct and a handler function per tool, then register them in a `ToolPack`:
+The snippet at the top of this page is the complete handler. It needs these imports:
 
 ```zig
 const std = @import("std");
 const mcp = @import("zig_mcp_sdk");
 const types = mcp.types;
 const Allocator = std.mem.Allocator;
-
-const HelloArgs = struct {
-    name: []const u8,
-    pub const descriptions = .{ .name = "Name to greet" };
-};
-
-fn hello(allocator: Allocator, args: HelloArgs) !types.CallToolResult {
-    const msg = try std.fmt.allocPrint(allocator, "Hello, {s}!", .{args.name});
-    return types.CallToolResult.text(allocator, msg);
-}
-
-const MyTools = mcp.ToolPack(.{
-    .hello = .{ .description = "Say hello", .handler = hello },
-});
 ```
 
 A `ToolPack` implements `listTools` and `callTool`, so it can serve as the handler by itself. Servers that also expose resources or prompts write a handler struct and embed the pack; see [`examples/greeter.zig`](examples/greeter.zig).
@@ -190,7 +181,23 @@ Over stdio, notifications interleave with responses on stdout. Over HTTP, notifi
 
 ### Schema generation
 
-`schemaForStruct` reflects on a struct at compile time and emits a JSON Schema string. `parseArgs` parses incoming arguments into the same struct, so the schema and the parser cannot drift apart. Supported field types: strings, bools, integers, floats, enums, slices, nested structs, and optionals of any of these. Struct defaults become schema defaults and make fields optional. A `pub const descriptions` declaration adds per-field descriptions.
+`schemaForStruct` reflects on a struct at compile time and emits a JSON Schema string. `parseArgs` parses incoming arguments into the same struct, so the schema and the parser cannot drift apart. Supported field types: strings, bools, integers, floats, enums, slices, nested structs, and optionals of any of these.
+
+Struct defaults become schema defaults and make fields optional; a `pub const descriptions` declaration adds per-field descriptions. This struct:
+
+```zig
+const SearchArgs = struct {
+    query: []const u8,
+    limit: u32 = 10,
+    pub const descriptions = .{ .query = "Search query", .limit = "Max results" };
+};
+```
+
+emits this schema (and `parseArgs` fills `limit` with 10 when absent):
+
+```json
+{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"limit":{"type":"integer","description":"Max results","default":10}},"required":["query"]}
+```
 
 ## Server Options
 
