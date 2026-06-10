@@ -23,6 +23,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build 
 - Request-scoped arena allocators: allocate freely in handlers, freed after the response
 - Zero-copy strings: parsed slices point into arena memory, no duplication
 - Handler methods resolved at comptime via `@hasDecl`, no vtables
+- Concurrent multi-session HTTP with server-sent events for notifications
 - No dependencies beyond the Zig standard library
 
 Requires Zig 0.16.0.
@@ -104,11 +105,11 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-HTTP transport (remote or cloud deployment):
+HTTP transport (remote or cloud deployment). Connections are handled concurrently, so use a thread-safe allocator:
 
 ```zig
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
+    const allocator = std.heap.smp_allocator;
 
     var handler = MyHandler{};
     var server = mcp.Server(MyHandler).init(allocator, &handler, .{
@@ -119,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
     var transport = mcp.HttpTransport(MyHandler).init(allocator, &server, .{
         .port = 8080,
     });
+    defer transport.deinit();
     try transport.listen(init.io);
 }
 ```
@@ -258,6 +260,11 @@ curl -X POST http://localhost:8080 \
   -H "Accept: application/json" \
   -H "Mcp-Session-Id: <session-id>" \
   -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"hello","arguments":{"name":"World"}},"id":2}'
+
+# Open the SSE stream for server-initiated notifications
+curl -N http://localhost:8080 \
+  -H "Accept: text/event-stream" \
+  -H "Mcp-Session-Id: <session-id>"
 ```
 
 ## Building
@@ -281,7 +288,7 @@ CI runs `zig build check` plus two conformance scripts: [`scripts/conformance.sh
 ## Examples
 
 - [`examples/greeter.zig`](examples/greeter.zig): stdio server with tools, resources, and prompts
-- [`examples/greeter_http.zig`](examples/greeter_http.zig): HTTP server with tools
+- [`examples/greeter_http.zig`](examples/greeter_http.zig): HTTP server with tools and SSE log notifications
 - [`examples/channel.zig`](examples/channel.zig): Claude channel protocol example
 
 ## License
