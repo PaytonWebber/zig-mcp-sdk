@@ -35,8 +35,22 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) SDK for Zig. Build 
 - Handler methods resolved at comptime via `@hasDecl`, no vtables
 - Concurrent multi-session HTTP with server-sent events for notifications
 - No dependencies beyond the Zig standard library
+- Conformance-tested in CI over both transports
 
 Requires Zig 0.16.0.
+
+## What you ship
+
+[sqlite-mcp](https://github.com/PaytonWebber/sqlite-mcp) is a complete server built with this SDK: read-only SQLite access with tools, schema resources, and all of SQLite compiled in. Measured on the stripped `ReleaseSmall` x86_64-linux build:
+
+| | sqlite-mcp (this SDK) | typical Python MCP server | typical TypeScript MCP server |
+|---|---|---|---|
+| Ships as | one static binary | virtualenv + interpreter | node_modules + Node.js |
+| Disk footprint | **1.0 MB** | tens of MB plus a Python install | tens of MB plus a Node install |
+| Cold start, handshake, first query | **under 10 ms** | interpreter startup | runtime startup |
+| Resident memory | **3.7 MB** | tens of MB | tens of MB |
+
+Users download one file and run `claude mcp add`. There is nothing else to install.
 
 ## Quick Start
 
@@ -331,6 +345,10 @@ CI runs `zig build check` plus two conformance scripts: [`scripts/conformance.sh
 - [`examples/greeter.zig`](examples/greeter.zig): stdio server with tools, resources, and prompts
 - [`examples/greeter_http.zig`](examples/greeter_http.zig): HTTP server with tools and SSE log notifications
 - [`examples/channel.zig`](examples/channel.zig): Claude channel protocol example
+
+Built with this SDK:
+
+- [sqlite-mcp](https://github.com/PaytonWebber/sqlite-mcp): read-only SQLite access for AI agents in a single ~1 MB static binary
 
 ## License
 
